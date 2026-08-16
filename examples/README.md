@@ -27,6 +27,15 @@ smolvm machine exec --name browser -- \
 smolvm machine exec --name browser -- base64 /tmp/out.png | base64 -d > out.png
 ```
 
+### Docker Compose backend
+
+[`docker-compose/`](docker-compose/) validates Docker Engine inside a
+persistent VM with host Compose control, a dedicated host-directory mount,
+published TCP, and Unix-socket proxies in both directions.
+
+See [`docker-compose/README.md`](docker-compose/README.md) for the complete
+setup and validation commands.
+
 ### Persistent microVMs
 
 ```bash
