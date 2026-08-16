@@ -1,0 +1,27 @@
+# Docker Compose backend evaluation.
+#
+# Run commands from the smolvm repository root. The host fixture directory is
+# attached to the VM at a stable guest path so the in-VM Docker daemon can bind
+# its files into Compose containers.
+
+cpus = 2
+memory = 2048
+net = true
+storage = 20
+overlay = 10
+
+# Expose the guest's /var/run/docker.sock to the host. This lets a host Docker
+# client and docker-compose control the daemon running inside the VM.
+docker_socket = true
+
+init = [
+    "apk update -q",
+    "apk add docker -q",
+    "mkdir -p /storage/docker",
+]
+
+[dev]
+volumes = [
+    "./examples/docker-compose/fixtures:/workspace/smol/docker-compose/fixtures:ro",
+]
+ports = ["18080:8080"]
