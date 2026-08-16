@@ -1,0 +1,31 @@
+name: smolvm-compose-evaluation
+
+services:
+  app:
+    image: python:3.13-alpine
+    command: ["python", "/app/server.py"]
+    init: true
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /workspace/smol/docker-compose/fixtures/server.py
+        target: /app/server.py
+        read_only: true
+      - type: bind
+        source: /workspace/smol/docker-compose/fixtures/socket_probe.py
+        target: /app/socket_probe.py
+        read_only: true
+      - type: bind
+        source: /run/smol-compose-evaluation
+        target: /run/smol-compose-evaluation
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read() == b'port-exposure-ok\\n'"
+      interval: 2s
+      timeout: 3s
+      retries: 30

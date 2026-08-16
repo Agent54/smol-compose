@@ -4,6 +4,10 @@
 # as root via VmExec, so Docker gets full kernel privileges without any
 # capability restrictions.
 #
+# For an end-to-end Docker Compose backend test covering a dedicated host
+# directory, port forwarding, and Unix sockets in both directions, see
+# examples/docker-compose/README.md.
+#
 # This also works with `--image`: a privileged (default) image-based machine
 # runs in an OCI container, but /storage is bind-mounted into it, so the same
 # `mount --bind /storage/docker /var/lib/docker` resolves to the ext4 disk just
