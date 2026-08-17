@@ -4,6 +4,27 @@ This example originated as an Apple Silicon feasibility evaluation outside the
 smolvm checkout. It was moved here so the exact Compose, mount, port, and socket
 fixtures can be maintained alongside the existing Docker-in-VM example.
 
+## Current branch validation
+
+The maintained example was run end-to-end on Apple Silicon macOS on 2026-08-17
+with Docker Engine 28.5.2 and `overlay2`:
+
+- a normal Smolfile-created machine auto-started Docker without a manual
+  `dockerd` command;
+- host `docker-compose` reached Docker through
+  `examples/docker-compose/.state/docker.sock`;
+- the TCP probe and both arbitrary Unix-socket directions passed before and
+  after a full VM stop/start;
+- `pack create` produced a signed launcher and a compressed `.smolmachine` in
+  `examples/docker-compose/.state/`; and
+- a fresh machine created from that artifact started without pulling
+  `docker:28-dind`, auto-started Docker, and passed the same Compose, TCP, and
+  bidirectional socket probes.
+
+All runtime databases, disks, build staging, artifacts, logs, and Unix sockets
+used for this validation were kept below the example's ignored `.state`
+directory.
+
 ## Provenance
 
 - evaluated smolvm `main`: `e2e04fa1d55190bc7fd4144b5bae29b3d870b8d4`;
@@ -17,7 +38,7 @@ fixtures can be maintained alongside the existing Docker-in-VM example.
 
 - the VM remained reachable with virtio-net enabled;
 - host `docker-compose` controlled the in-VM Docker daemon through
-  `<machine-data-dir>/docker.sock`;
+  `examples/docker-compose/.state/docker.sock`;
 - host port `18080` reached container port `8080`;
 - files from the dedicated host fixture directory were bind-mounted into the
   Compose container through the VM;
@@ -39,9 +60,10 @@ fixtures can be maintained alongside the existing Docker-in-VM example.
 4. The released installation lacked preformatted ext4 templates and therefore
    needed host `mkfs.ext4`. Current release packaging creates storage and
    overlay templates, so this should be a build-time dependency only.
-5. Init commands run once, while `/run` and mount namespaces are recreated at
-   boot. Consequently neither a background `dockerd` process nor a bind mount
-   used for `/var/lib/docker` survives a VM stop and start.
+5. The original bare-VM fixture installed Docker with one-time init commands,
+   so a background `dockerd` process did not survive a VM stop and start. The
+   maintained example now uses the DinD image as the persistent workload;
+   SmolVM relaunches its entrypoint on every machine start.
 
 ## Improvements adopted from `docker-in-vm`
 
@@ -60,6 +82,6 @@ to the daemon and remains correct after every VM restart.
 ## Coverage added by this example
 
 The Docker-in-VM example validates Docker Engine itself but does not exercise a
-Compose application, a dedicated host project directory, the outer VM port
-mapping, or arbitrary Unix-socket proxies in both directions. This example
-adds those integration paths while reusing its storage guidance.
+Compose application, the outer VM port mapping, or arbitrary Unix-socket
+proxies in both directions. This example adds those integration paths while
+reusing its storage guidance.
