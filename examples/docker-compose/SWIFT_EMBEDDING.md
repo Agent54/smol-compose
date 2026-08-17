@@ -31,6 +31,12 @@ Verify both artifacts against `checksums.sha256`. The normal distribution and
 the Compose sidecar must come from the same release. Do not download `latest`
 when the application starts.
 
+After verifying the versioned sidecar, copy it into the application bundle as
+`docker-compose.smolmachine`. All paths and Swift examples below use that stable
+bundled name. An application that preserves the versioned release filename must
+instead resolve that exact filename everywhere the examples refer to
+`docker-compose.smolmachine`.
+
 Preserve the extracted distribution layout in the application bundle:
 
 ```text
@@ -51,9 +57,21 @@ MyManager.app/
 ```
 
 Both release assets are required. The distribution contains the macOS runtime,
-the network-enabled libkrun build, the agent rootfs, and disk templates. The
-`.smolmachine` contains the already-resolved Docker image layers and workload
-configuration. The Swift project should not build libkrun or the Docker image.
+the agent rootfs, disk templates, and the fork's pinned libkrun build compiled
+with `BLK=1 NET=1 GPU=1`. `NET=1` provides
+`krun_add_net_unixstream`, which SmolVM uses for virtio-net and the Unix socket
+bridges required by this backend. That library also embeds `krun-init` built as
+a static `aarch64-unknown-linux-musl` executable, so the guest init is Linux
+code with no unavailable dynamic runtime dependency rather than a macOS or
+dynamically linked executable.
+
+The `.smolmachine` contains the already-resolved Docker image layers and
+workload configuration. Together, these release assets are the distributable
+form of the earlier development proof that selected a newly built
+`libkrun.dylib` through `DYLD_LIBRARY_PATH`: the app still points the loader at
+its bundled `lib/` directory, but it no longer substitutes an unpublished
+development library. The Swift project should not build libkrun, krun-init, or
+the Docker image.
 
 ## Runtime environment
 
