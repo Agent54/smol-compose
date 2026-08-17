@@ -5,6 +5,10 @@ workload and drives it from host `docker-compose` through SmolVM's
 guest-to-host Docker socket bridge. The image entrypoint starts `dockerd`
 automatically whenever the VM starts.
 
+For a dependency-free macOS application integration that embeds the released
+runtime and runs Compose inside the VM, see
+[`SWIFT_EMBEDDING.md`](SWIFT_EMBEDDING.md).
+
 It validates all of the paths needed by a local Compose backend:
 
 - a host TCP port forwarded through the VM to a Compose container;
