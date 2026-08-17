@@ -1,27 +1,24 @@
-# Docker Compose backend evaluation.
+# Docker Compose backend evaluation and distributable image definition.
 #
-# Run commands from the smolvm repository root. The host fixture directory is
-# attached to the VM at a stable guest path so the in-VM Docker daemon can bind
-# its files into Compose containers.
+# The official DinD image already contains Docker Engine. Its OCI entrypoint
+# starts dockerd automatically when the machine starts, including after a VM
+# restart and when this image is bundled into a .smolmachine release artifact.
+
+image = "docker:28-dind"
+entrypoint = ["/usr/local/bin/dockerd-entrypoint.sh"]
+cmd = [
+    # Supplying `dockerd` explicitly prevents the DinD entrypoint from adding
+    # an unauthenticated TCP listener. The host reaches Docker only through
+    # the published Unix socket below.
+    "dockerd",
+    "--host=unix:///var/run/docker.sock",
+    "--data-root=/storage/docker",
+    "--storage-driver=overlay2",
+]
+env = ["DOCKER_TLS_CERTDIR="]
 
 cpus = 2
 memory = 2048
 net = true
 storage = 20
 overlay = 10
-
-# Expose the guest's /var/run/docker.sock to the host. This lets a host Docker
-# client and docker-compose control the daemon running inside the VM.
-docker_socket = true
-
-init = [
-    "apk update -q",
-    "apk add docker -q",
-    "mkdir -p /storage/docker",
-]
-
-[dev]
-volumes = [
-    "./examples/docker-compose/fixtures:/workspace/smol/docker-compose/fixtures:ro",
-]
-ports = ["18080:8080"]

@@ -22,6 +22,7 @@
 
 use smolvm_protocol::guest_env;
 use smolvm_protocol::publish_socket::{decode, PublishedSocket, SocketDirection};
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -47,7 +48,7 @@ const MOUNT_SOCKET_DIR: &str = "/run/smolvm/published-sockets";
 /// per boot, but the lock lets tests reset it — with `OnceLock`, a single
 /// [`start_all`] call in one test would permanently poison the "nothing
 /// published yet" invariant for every other test in the process.
-static PUBLISHED_MOUNTS: RwLock<Vec<PublishedSocket>> = RwLock::new(Vec::new());
+static PUBLISHED_SOCKETS: RwLock<Vec<PublishedSocket>> = RwLock::new(Vec::new());
 
 /// Start every user-published socket bridge. No-op when none are configured.
 ///
@@ -62,7 +63,16 @@ pub fn start_all() {
     let mut published = Vec::new();
     for sock in decode(&encoded) {
         match sock.direction {
-            SocketDirection::Expose => spawn_bridge(sock, serve_expose),
+            SocketDirection::Expose => {
+                if let Some(parent) = Path::new(&sock.guest_path).parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        log_bridge_error(&sock, &e);
+                        continue;
+                    }
+                }
+                published.push(sock.clone());
+                spawn_bridge(sock, serve_expose);
+            }
             SocketDirection::Mount => match prepare_mount_listener(&sock) {
                 Ok(listener) => {
                     published.push(sock.clone());
@@ -72,7 +82,7 @@ pub fn start_all() {
             },
         }
     }
-    *PUBLISHED_MOUNTS
+    *PUBLISHED_SOCKETS
         .write()
         .expect("published-sockets registry lock poisoned") = published;
 }
@@ -119,14 +129,63 @@ fn mount_socket_path(vsock_port: u32) -> PathBuf {
 /// after the user-volume mounts makes the socket visible even when its public path
 /// is nested under a volume target.
 pub fn inject_into_container(spec: &mut crate::oci::OciSpec) {
-    let published = PUBLISHED_MOUNTS
+    let published = PUBLISHED_SOCKETS
         .read()
         .expect("published-sockets registry lock poisoned");
-    inject_sockets_into_container(spec, &published);
+    inject_sockets_into_container(spec, crate::docker_bridge::is_enabled(), &published);
 }
 
-fn inject_sockets_into_container(spec: &mut crate::oci::OciSpec, sockets: &[PublishedSocket]) {
+fn inject_sockets_into_container(
+    spec: &mut crate::oci::OciSpec,
+    docker_socket: bool,
+    sockets: &[PublishedSocket],
+) {
+    // Image workloads have their own mount namespace. Share directories that
+    // contain sockets created by the image so the agent-side relay can reach
+    // them. Mount-direction sockets remain individual file mounts below.
+    let mut shared_dirs = HashSet::new();
+    if docker_socket {
+        spec.add_bind_mount("/run", "/run", false);
+        shared_dirs.insert(PathBuf::from("/run"));
+    }
+
+    for sock in sockets
+        .iter()
+        .filter(|sock| sock.direction == SocketDirection::Expose)
+    {
+        let Some(parent) = Path::new(&sock.guest_path).parent() else {
+            continue;
+        };
+        // `/var/run` is normally a symlink to `/run` in both the VM root and
+        // OCI images. Bind the real directory so crun never has to mount
+        // through a symlink and both namespaces resolve docker.sock identically.
+        let parent = if let Ok(suffix) = parent.strip_prefix("/var/run") {
+            if suffix.as_os_str().is_empty() {
+                PathBuf::from("/run")
+            } else {
+                Path::new("/run").join(suffix)
+            }
+        } else {
+            parent.to_path_buf()
+        };
+        // Never overlay the image root with the VM root. Image workloads
+        // should put exposed sockets in a directory such as /run/app.
+        if parent == Path::new("/") {
+            continue;
+        }
+        if shared_dirs.iter().any(|shared| parent.starts_with(shared)) {
+            continue;
+        }
+        if shared_dirs.insert(parent.clone()) {
+            let parent = parent.to_string_lossy();
+            spec.add_bind_mount(&parent, &parent, false);
+        }
+    }
+
     for sock in sockets {
+        if sock.direction != SocketDirection::Mount {
+            continue;
+        }
         spec.add_bind_mount(
             &mount_socket_path(sock.vsock_port).to_string_lossy(),
             &sock.guest_path,
@@ -447,7 +506,7 @@ mod mount_tests {
         // bridge that never came up must not reach the spec at all.
         // Reset the registry explicitly: the invariant being guarded is about
         // what the registry *contains*, not about test execution order.
-        PUBLISHED_MOUNTS
+        PUBLISHED_SOCKETS
             .write()
             .expect("published-sockets registry lock poisoned")
             .clear();
@@ -463,7 +522,11 @@ mod mount_tests {
         spec.add_bind_mount("/mnt/virtiofs/shared", "/run/control", false);
         let volume_index = spec.mounts.len() - 1;
 
-        inject_sockets_into_container(&mut spec, &[mount_sock(6100, "/run/control/engine.sock")]);
+        inject_sockets_into_container(
+            &mut spec,
+            false,
+            &[mount_sock(6100, "/run/control/engine.sock")],
+        );
 
         let socket_index = spec
             .mounts
@@ -480,6 +543,67 @@ mod mount_tests {
             mount_socket_path(6100).to_string_lossy()
         );
         assert_eq!(socket_mount.mount_type.as_deref(), Some("bind"));
+    }
+
+    #[test]
+    fn expose_socket_directory_is_shared_with_image_container() {
+        let mut spec = spec();
+        let exposed = PublishedSocket {
+            vsock_port: 6200,
+            guest_path: "/run/control/app.sock".into(),
+            direction: SocketDirection::Expose,
+        };
+
+        inject_sockets_into_container(&mut spec, false, &[exposed]);
+
+        assert!(spec.mounts.iter().any(|mount| {
+            mount.source == "/run/control" && mount.destination == "/run/control"
+        }));
+    }
+
+    #[test]
+    fn var_run_expose_socket_shares_real_run_directory() {
+        let mut spec = spec();
+        let exposed = PublishedSocket {
+            vsock_port: 6200,
+            guest_path: "/var/run/docker.sock".into(),
+            direction: SocketDirection::Expose,
+        };
+
+        inject_sockets_into_container(&mut spec, false, &[exposed]);
+
+        assert!(spec
+            .mounts
+            .iter()
+            .any(|mount| mount.source == "/run" && mount.destination == "/run"));
+        assert!(!spec.mounts.iter().any(|mount| mount.source == "/var/run"));
+    }
+
+    #[test]
+    fn docker_socket_shares_run_once_and_mount_socket_overlays_it() {
+        let mut spec = spec();
+        let sockets = [
+            PublishedSocket {
+                vsock_port: 6200,
+                guest_path: "/run/control/app.sock".into(),
+                direction: SocketDirection::Expose,
+            },
+            mount_sock(6201, "/run/control/host.sock"),
+        ];
+
+        inject_sockets_into_container(&mut spec, true, &sockets);
+
+        assert_eq!(
+            spec.mounts
+                .iter()
+                .filter(|mount| mount.source == "/run" && mount.destination == "/run")
+                .count(),
+            1
+        );
+        assert!(spec
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == "/run/control/host.sock"));
     }
 }
 

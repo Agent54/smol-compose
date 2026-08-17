@@ -1,23 +1,38 @@
 # Docker Compose backend
 
-This example runs Docker Engine inside a persistent SmolVM machine and drives
-it from host `docker-compose` through SmolVM's guest-to-host Docker socket
-bridge.
+This example runs the official Docker-in-Docker image as a persistent SmolVM
+workload and drives it from host `docker-compose` through SmolVM's
+guest-to-host Docker socket bridge. The image entrypoint starts `dockerd`
+automatically whenever the VM starts.
 
 It validates all of the paths needed by a local Compose backend:
 
-- a dedicated host directory mounted into the VM and then into a container;
 - a host TCP port forwarded through the VM to a Compose container;
 - the guest Docker socket exposed to a host Docker client;
 - a host Unix socket mounted into the VM and Compose container; and
 - a Compose-container Unix socket exposed through the VM to the host.
 
-Run the commands below from the smolvm repository root. The example has no
-cleanup script and does not delete host files automatically.
+Run the commands below from the smolvm repository root.
+
+## One-command verification
+
+With a release build and its agent rootfs available, run the complete normal,
+restart, pack, and embedded-artifact test:
+
+```sh
+./examples/docker-compose/verify.sh
+```
+
+The script creates unique test machines and keeps every generated database,
+disk, log, staging file, artifact, and socket below the ignored
+`examples/docker-compose/.state/` directory. It stops and deletes only the
+unique machines it created after a successful run. Set `KEEP_STATE=1` to keep
+the machines and packed artifact for inspection. Set `SMOLVM=/path/to/smolvm`
+to test a distribution binary instead of `target/release/smolvm`.
 
 ## Requirements
 
-- a SmolVM build whose libkrun includes block and virtio-net support;
+- a current SmolVM build whose libkrun includes block and virtio-net support;
 - `docker` and `docker-compose` host clients;
 - `socat`, `curl`, and Python 3 on the host.
 
@@ -34,6 +49,14 @@ Create the example's ignored runtime directory:
 ```sh
 mkdir -p examples/docker-compose/.state
 ```
+
+Keep the test machine database, disks, logs, and runtime sockets there too:
+
+```sh
+export SMOLVM_DATA_DIR="$PWD/examples/docker-compose/.state"
+```
+
+Use the same exported value for every `smolvm` command in this example.
 
 In terminal 1, start a host socket that returns `host-to-vm-ok`:
 
@@ -52,6 +75,8 @@ smolvm machine create \
   --name docker-compose-evaluation \
   --smolfile examples/docker-compose/docker-compose.smolfile \
   --net-backend virtio-net \
+  --port 18080:8080 \
+  --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/.state/docker.sock" \
   --mount-socket "$PWD/examples/docker-compose/.state/host-to-vm.sock:/run/smol-compose-evaluation/host.sock" \
   --expose-socket "/run/smol-compose-evaluation/guest.sock:$PWD/examples/docker-compose/.state/vm-to-host.sock"
 ```
@@ -60,41 +85,31 @@ smolvm machine create \
 smolvm machine start --name docker-compose-evaluation
 ```
 
-The Smolfile installs Docker once and mounts the fixture directory at
-`/workspace/smol/docker-compose/fixtures` inside the VM.
+The first start pulls `docker:28-dind`; subsequent starts use the persistent
+image layers. The image entrypoint starts `dockerd` with its data root on the
+VM's persistent ext4 storage disk. The Smolfile passes an explicit Unix-only
+Docker host, so the DinD entrypoint does not add its unauthenticated TCP
+listener.
 
-## 3. Start Docker Engine
+## 3. Wait for Docker Engine
 
-Start `dockerd` as a detached guest process:
-
-```sh
-smolvm machine exec --name docker-compose-evaluation --detach -- \
-  dockerd --data-root=/storage/docker --storage-driver=overlay2
-```
-
-Check readiness:
+The image workload starts Docker automatically. Check readiness:
 
 ```sh
 smolvm machine exec --name docker-compose-evaluation -- docker info
 ```
 
 If Docker is still starting, run the readiness command again. Docker data is
-written directly to the persistent ext4 storage disk. This avoids both nested
-overlayfs and the non-persistent `/storage/docker` to `/var/lib/docker` bind
-mount used by older examples.
+written directly to `/storage/docker` on the persistent ext4 disk, avoiding
+nested overlayfs.
 
 ## 4. Connect host Compose to the guest daemon
 
-Print the machine data directory:
+Set `DOCKER_HOST` to the socket exposed in the example's ignored state
+directory:
 
 ```sh
-smolvm machine data-dir --name docker-compose-evaluation
-```
-
-Set `DOCKER_HOST` to the `docker.sock` inside the printed directory:
-
-```sh
-export DOCKER_HOST="unix:///the/printed/machine/data/directory/docker.sock"
+export DOCKER_HOST="unix://$PWD/examples/docker-compose/.state/docker.sock"
 ```
 
 Confirm that the client reaches the daemon inside the VM:
@@ -109,9 +124,9 @@ Start the Compose application:
 docker-compose -f examples/docker-compose/compose.yaml up -d --wait
 ```
 
-The absolute bind sources in `compose.yaml` are guest paths. Bind paths are
-resolved by the Docker daemon, which runs inside the VM, rather than by the
-host client.
+The `/run/smol-compose-evaluation` bind source in `compose.yaml` is a guest
+path. Bind paths are resolved by the Docker daemon, which runs inside the VM,
+rather than by the host client.
 
 ## 5. Validate the backend paths
 
@@ -131,7 +146,7 @@ Compose container through the mounted VM socket to the host fixture:
 
 ```sh
 docker-compose -f examples/docker-compose/compose.yaml exec -T app \
-  python /app/socket_probe.py /run/smol-compose-evaluation/host.sock host-to-vm-ok
+  python -c 'import socket; s=socket.socket(socket.AF_UNIX); s.connect("/run/smol-compose-evaluation/host.sock"); s.sendall(b"probe\n"); s.shutdown(socket.SHUT_WR); print(s.recv(4096).decode().strip())'
 ```
 
 Expected output:
@@ -156,14 +171,42 @@ vm-to-host-ok
 ## Restart behavior
 
 Docker images, containers, and volumes persist under `/storage/docker` across a
-machine stop and start. The current SmolVM agent does not automatically restart
-`dockerd`, so run the detached `dockerd` command again after every machine
-start. The Compose service uses `restart: unless-stopped`, allowing Docker to
-restore it after the daemon starts.
+machine stop and start. SmolVM relaunches the image workload on each machine
+start, so the image entrypoint automatically starts `dockerd`. The Compose
+service uses `restart: unless-stopped`, allowing Docker to restore it after the
+daemon is ready.
 
-This is the remaining lifecycle gap for using SmolVM as an unattended Compose
-backend. A general agent-managed guest-service facility would remove it without
-requiring systemd or another supervisor in the guest.
+## Build an embedded release artifact
+
+Bundle the Docker image, image metadata, VM runtime, agent rootfs, and disk
+template into a portable release artifact:
+
+```sh
+smolvm pack create \
+  --smolfile examples/docker-compose/docker-compose.smolfile \
+  --output examples/docker-compose/.state/docker-compose-runtime
+```
+
+The result includes
+`examples/docker-compose/.state/docker-compose-runtime.smolmachine`. An
+embedded distribution can ship that sidecar and create a ready-to-start
+machine without pulling the Docker image:
+
+```sh
+smolvm machine create \
+  --name docker-compose-evaluation \
+  --from examples/docker-compose/.state/docker-compose-runtime.smolmachine \
+  --net-backend virtio-net \
+  --port 18080:8080 \
+  --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/.state/docker.sock" \
+  --mount-socket "$PWD/examples/docker-compose/.state/host-to-vm.sock:/run/smol-compose-evaluation/host.sock" \
+  --expose-socket "/run/smol-compose-evaluation/guest.sock:$PWD/examples/docker-compose/.state/vm-to-host.sock"
+```
+
+The Docker socket endpoint, arbitrary socket endpoints, host mounts, and host ports
+remain launch-site capabilities: the embedded application chooses their host
+paths when it creates the machine rather than baking machine-specific paths
+into the portable artifact.
 
 ## Stop without deleting state
 
