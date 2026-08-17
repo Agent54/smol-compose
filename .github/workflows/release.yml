@@ -505,11 +505,84 @@ jobs:
           path: dist/smolvm-*-windows-x86_64.zip
 
   # ==========================================================================
+  # Verify and package the optional Docker Compose guest (Apple Silicon)
+  # ==========================================================================
+  build-compose-runtime:
+    name: Verify Docker Compose release asset (darwin-arm64)
+    needs: build-dist
+    runs-on: [self-hosted, macOS, ARM64, hypervisor]
+    timeout-minutes: 45
+    concurrency:
+      group: docker-compose-hypervisor
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install host clients and image tools
+        run: brew install docker docker-compose e2fsprogs socat
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-darwin-arm64
+          path: examples/docker-compose/.state/release-dist-${{ github.run_id }}.download
+
+      - name: Extract the exact distribution being released
+        id: dist
+        run: |
+          archive=(examples/docker-compose/.state/release-dist-${{ github.run_id }}.download/smolvm-*-darwin-arm64.tar.gz)
+          if [[ "${#archive[@]}" != 1 || ! -f "${archive[0]}" ]]; then
+            echo "error: expected exactly one darwin-arm64 distribution archive" >&2
+            exit 1
+          fi
+          mkdir -p examples/docker-compose/.state/release-dist-${{ github.run_id }}.dir
+          tar -xzf "${archive[0]}" -C examples/docker-compose/.state/release-dist-${{ github.run_id }}.dir
+          runtime=(examples/docker-compose/.state/release-dist-${{ github.run_id }}.dir/smolvm-*-darwin-arm64)
+          if [[ "${#runtime[@]}" != 1 || ! -x "${runtime[0]}/smolvm" ]]; then
+            echo "error: extracted darwin-arm64 runtime was not found" >&2
+            exit 1
+          fi
+          echo "root=${runtime[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Run Compose verification against the release distribution
+        run: ./examples/docker-compose/verify.sh
+        env:
+          EXPORT_PACK: '1'
+          SMOLVM: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/smolvm
+          SMOLVM_AGENT_ROOTFS: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/agent-rootfs
+          SMOLVM_LIB_DIR: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/lib
+          LIBKRUN_BUNDLE: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/lib
+
+      - name: Name the verified release asset
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ -z "$version" ]]; then
+            echo "error: could not read package version" >&2
+            exit 1
+          fi
+          cp \
+            examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine \
+            "examples/docker-compose/.state/smolvm-${version}-docker-compose-darwin-arm64.smolmachine"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-compose-runtime
+          path: examples/docker-compose/.state/smolvm-*-docker-compose-darwin-arm64.smolmachine
+          if-no-files-found: error
+
+      - name: Remove workflow-owned state
+        if: always()
+        run: |
+          rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine
+          rm -f -- examples/docker-compose/.state/smolvm-*-docker-compose-darwin-arm64.smolmachine
+          rm -rf -- examples/docker-compose/.state/release-dist-${{ github.run_id }}.download
+          rm -rf -- examples/docker-compose/.state/release-dist-${{ github.run_id }}.dir
+
+  # ==========================================================================
   # Create GitHub Release
   # ==========================================================================
   release:
     name: Create Release
-    needs: [build-dist, build-dist-windows]
+    needs: [build-dist, build-dist-windows, build-compose-runtime]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -529,7 +602,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip > checksums.sha256
+          sha256sum *.tar.gz *.zip *.smolmachine > checksums.sha256
           cat checksums.sha256
 
       - name: Create GitHub Release
@@ -541,6 +614,7 @@ jobs:
             --generate-notes \
             dist/*.tar.gz \
             dist/*.zip \
+            dist/*.smolmachine \
             dist/checksums.sha256
 
       # Ping the Homebrew tap to bump its formula to this release immediately,
