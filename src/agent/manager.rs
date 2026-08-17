@@ -579,6 +579,15 @@ pub fn read_egress_telemetry(name: &str) -> Option<u64> {
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
+    if let Some(root) = crate::process::explicit_data_root() {
+        // Keep named-agent AF_UNIX paths below macOS's 104-byte sun_path
+        // ceiling even when the caller places the state root in a project.
+        // The per-VM directory is already a namespaced 16-hex hash, so it can
+        // live directly below the explicit root. Even a two-character `/v`
+        // component is enough to make libkrun's `control.sock` exceed the
+        // limit for a project-local `.state` directory.
+        return root;
+    }
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -603,6 +612,9 @@ pub fn network_registry_dir(network: &str) -> PathBuf {
 /// (`<cache_dir>/smolvm/uids/`), a sibling of the VM data dirs. Root-managed; the
 /// dropped VMMs never touch it. See `process::allocate_vm_uid`.
 pub fn vm_uid_registry_dir() -> PathBuf {
+    if let Some(root) = crate::process::explicit_data_root() {
+        return root.join("uids");
+    }
     vm_cache_root()
         .parent()
         .map(|p| p.join("uids"))

@@ -21,11 +21,10 @@ The user has specifically asked for:
 - simple, individually reviewable commands, with no wrapper shell scripts,
   chained shell logic, hidden cleanup, or destructive host operations.
 
-Do not modify SmolVM runtime source merely to improve this example unless the
-user explicitly authorizes implementing a runtime feature. A previous turn
-unexpectedly started implementing boot-service behavior in SmolVM source and
-the user required it to be undone. At the start of the example move, the
-SmolVM worktree was clean.
+Runtime source changes require explicit user authorization. The current work
+was explicitly authorized to add bidirectional Unix-socket support to embedded
+machine records and to make Docker auto-start as the image workload. At the
+start of the example move, the SmolVM worktree was clean.
 
 Do not automatically start, stop, delete, or recreate the user's existing VM.
 Show any mutating commands plainly and let the user review them first unless
@@ -93,8 +92,9 @@ default host HOME with this short HOME: SmolVM will look in a different machine
 database and report that the machine does not exist or is stopped.
 
 The new documented example uses the distinct name
-`docker-compose-evaluation`; it has not been run end-to-end since the files
-were moved.
+`docker-compose-evaluation`. It was run end-to-end after the files were moved,
+including a stop/start cycle and a second run from a freshly built
+`.smolmachine` artifact.
 
 ## Failure history and correct interpretations
 
@@ -174,11 +174,10 @@ Docker state belongs directly on `/storage/docker`, the VM's persistent ext4
 disk. The root filesystem is already overlayfs, so Docker `overlay2` must not
 place its upper layers there.
 
-The current remaining lifecycle gap is automatic daemon startup. After every
-VM start, `dockerd` must currently be launched again. The preferred upstream
-direction is an agent-managed, generic persistent guest-service facility—not
-systemd, supervisord, or a Docker-only special case. This is a proposal, not an
-implemented or approved source change.
+Automatic daemon startup is handled by making `docker:28-dind` the persistent
+image workload. SmolVM relaunches its entrypoint on every VM start; the example
+passes an explicit Unix-only `dockerd` command and keeps Docker state on
+`/storage/docker`.
 
 ## SDK, API, and Swift integration findings
 
@@ -189,8 +188,8 @@ The public `smolmachines` embedded SDK targets Node/TypeScript and Python. Its
 documented local configuration covers mounts and ports but does not expose the
 complete socket functionality needed by this backend. In the evaluated source:
 
-- the embedded SDK did not expose `dockerSocket`, `mount-socket`, or
-  `expose-socket` configuration;
+- the Rust embedded machine record now persists the Docker socket and generic
+  `mount-socket` / `expose-socket` configuration used by the launcher;
 - the REST create API exposed `dockerSocket` but not arbitrary published
   sockets;
 - the CLI was the only complete interface for both arbitrary socket

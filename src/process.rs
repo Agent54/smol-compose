@@ -1125,6 +1125,24 @@ pub fn apply_system_data_root(allow_auto: bool) {
 #[cfg(not(target_os = "linux"))]
 pub fn apply_system_data_root(_allow_auto: bool) {}
 
+/// Explicit state root requested by the caller.
+///
+/// Linux applies this by relocating `HOME` before path discovery. Other hosts
+/// do not have that uid-drop requirement, so path constructors consult this
+/// value directly instead. Keeping the accessor cross-platform also lets code
+/// that owns a concrete state path avoid depending on `dirs` platform policy.
+#[cfg(not(target_os = "linux"))]
+pub fn explicit_data_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("SMOLVM_DATA_DIR").map(std::path::PathBuf::from)
+}
+
+/// Linux already applies the explicit root by relocating `HOME` before any
+/// paths are computed, so callers should continue through `dirs` there.
+#[cfg(target_os = "linux")]
+pub fn explicit_data_root() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own
 /// files (it fails with a cryptic readiness timeout). Returns the first ancestor

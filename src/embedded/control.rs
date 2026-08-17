@@ -1,7 +1,7 @@
 //! DB-backed VM lifecycle helpers for embedded SDK backends.
 
 use crate::agent::{AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources};
-use crate::config::{RecordState, VmRecord};
+use crate::config::{PublishedSocketConfig, RecordState, VmRecord};
 use crate::data::network::PortMapping;
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
@@ -35,6 +35,11 @@ pub struct MachineSpec {
     /// `VmResources` because hostname rules are persisted separately from the
     /// resolved CIDRs and refreshed by the DNS filter at runtime.
     pub allowed_hosts: Vec<String>,
+    /// Expose the guest Docker daemon socket to the host. The host endpoint is
+    /// created as `docker.sock` in the machine data directory.
+    pub docker_socket: bool,
+    /// Arbitrary host-to-guest and guest-to-host Unix-socket bridges.
+    pub published_sockets: Vec<PublishedSocketConfig>,
     /// Whether the machine should persist across stop/start.
     pub persistent: bool,
     /// Whether every start must use cloneable, memfd-backed guest RAM.
@@ -86,6 +91,8 @@ impl MachineSpec {
         record.gpu_vram_mib = self.resources.gpu_vram_mib;
         record.cuda = self.resources.cuda;
         record.image = self.image.clone();
+        record.docker_socket = self.docker_socket;
+        record.published_sockets = self.published_sockets.clone();
         record.labels = self.labels.clone();
         record.ephemeral = !self.persistent;
         record.forkable = self.forkable;
@@ -194,6 +201,10 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     // EINVAL.  The CLI start path performs the same two resolutions; embedded
     // SDK users must not get a subtly different VM configuration.
     let mut features = record_launch_features(record, features)?;
+    features.expose_docker |= record.docker_socket;
+    if features.published_sockets.is_empty() {
+        features.published_sockets = record.published_sockets.clone();
+    }
     if record.forkable_on_start() {
         features.forkable = true;
     }
@@ -875,6 +886,23 @@ mod tests {
             features.packed_layers_dir,
             Some(std::path::PathBuf::from("/srv/prepared-rootfs"))
         );
+    }
+
+    #[test]
+    fn record_carries_unix_socket_bridges() {
+        use smolvm_protocol::publish_socket::SocketDirection;
+
+        let mut spec = test_spec("sockets", true);
+        spec.docker_socket = true;
+        spec.published_sockets = vec![PublishedSocketConfig {
+            direction: SocketDirection::Expose,
+            guest_path: "/run/app.sock".into(),
+            host_path: Some("/tmp/app.sock".into()),
+        }];
+
+        let record = spec.to_record();
+        assert!(record.docker_socket);
+        assert_eq!(record.published_sockets, spec.published_sockets);
     }
 
     #[test]
