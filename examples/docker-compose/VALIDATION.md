@@ -20,6 +20,9 @@ with Docker Engine 28.5.2 and `overlay2`:
 - a fresh machine created from that artifact started without pulling
   `docker:28-dind`, auto-started Docker, and passed the same Compose, TCP, and
   bidirectional socket probes.
+- `EXPORT_PACK=1` retained the tested 132 MiB `darwin-arm64` sidecar after all
+  uniquely named test machines, sockets, launchers, logs, and staging files had
+  been cleaned up.
 
 All runtime databases, disks, build staging, artifacts, logs, and Unix sockets
 used for this validation were kept below the example's ignored `.state`
@@ -64,6 +67,12 @@ directory.
    so a background `dockerd` process did not survive a VM stop and start. The
    maintained example now uses the DinD image as the persistent workload;
    SmolVM relaunches its entrypoint on every machine start.
+6. Repeated validation exposed a shutdown ordering bug: `machine stop` synced
+   the guest filesystems but terminated the VM while the persistent `dockerd`
+   container was still running. Docker then failed to reopen its data root
+   after restart. The agent now gives registered main workload containers one
+   bounded SIGTERM window before forcing survivors and syncing the disks. The
+   complete restart and embedded-artifact flow passed with that fix.
 
 ## Improvements adopted from `docker-in-vm`
 

@@ -28,6 +28,25 @@ PACK_OUTPUT="$STATE_DIR/verify-pack-$SOCKET_ID.bin"
 PACK_STAGING="$STATE_DIR/verify-pack-$SOCKET_ID.staging"
 EMBEDDED_START_LOG="$STATE_DIR/verify-embedded-start-$SOCKET_ID.log"
 KEEP_STATE="${KEEP_STATE:-0}"
+EXPORT_PACK="${EXPORT_PACK:-0}"
+
+case "$(uname -s)" in
+    Darwin) PACK_HOST_OS="darwin" ;;
+    Linux) PACK_HOST_OS="linux" ;;
+    *)
+        printf 'error: unsupported pack host operating system: %s\n' "$(uname -s)" >&2
+        exit 1
+        ;;
+esac
+case "$(uname -m)" in
+    arm64|aarch64) PACK_HOST_ARCH="arm64" ;;
+    x86_64|amd64) PACK_HOST_ARCH="amd64" ;;
+    *)
+        printf 'error: unsupported pack host architecture: %s\n' "$(uname -m)" >&2
+        exit 1
+        ;;
+esac
+EXPORTED_PACK="$STATE_DIR/docker-compose-runtime-${PACK_HOST_OS}-${PACK_HOST_ARCH}.smolmachine"
 
 NORMAL_CREATED=0
 NORMAL_RUNNING=0
@@ -104,6 +123,8 @@ cleanup() {
         printf '\nVerification failed. State was preserved under %s\n' "$STATE_DIR" >&2
     elif [[ "$KEEP_STATE" == 1 ]]; then
         printf 'Verification state retained under %s\n' "$STATE_DIR"
+    elif [[ "$EXPORT_PACK" == 1 ]]; then
+        printf 'Verified pack retained at %s\n' "$EXPORTED_PACK"
     fi
 }
 trap cleanup EXIT
@@ -297,6 +318,10 @@ EMBEDDED_COMPOSE=1
 
 printf '5/5 Verifying embedded Compose paths\n'
 verify_paths "$EMBEDDED_DOCKER_SOCKET" "$EMBEDDED_VM_SOCKET" "$EMBEDDED_PORT"
+
+if [[ "$EXPORT_PACK" == 1 ]]; then
+    cp -- "$PACK_OUTPUT.smolmachine" "$EXPORTED_PACK"
+fi
 
 SUCCESS=1
 printf '\nDocker Compose verification passed.\n'
