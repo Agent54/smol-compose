@@ -1,0 +1,154 @@
+name: Docker Compose integration
+
+# This test boots real Apple Silicon microVMs. GitHub-hosted macOS runners do
+# not expose Hypervisor.framework to nested guests, so the final job requires a
+# self-hosted Apple Silicon runner with the additional `hypervisor` label.
+# Never run fork PR code on that persistent host.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/docker-compose.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/smolvm-agent/**'
+      - 'crates/smolvm-pack/**'
+      - 'examples/docker-compose/**'
+      - 'lib/**'
+      - 'scripts/build-agent-rootfs.sh'
+      - 'src/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/docker-compose.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/smolvm-agent/**'
+      - 'crates/smolvm-pack/**'
+      - 'examples/docker-compose/**'
+      - 'lib/**'
+      - 'scripts/build-agent-rootfs.sh'
+      - 'src/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: docker-compose-hypervisor
+  cancel-in-progress: false
+
+jobs:
+  build-agent:
+    name: Build Compose guest agent
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
+      - name: Build static Apple Silicon guest agent
+        run: cargo build --profile release-small -p smolvm-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compose-agent-aarch64
+          path: target/aarch64-unknown-linux-musl/release-small/smolvm-agent
+          if-no-files-found: error
+
+  build-rootfs:
+    name: Build Compose guest rootfs
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: build-agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: compose-agent-aarch64
+          path: examples/docker-compose/.state/ci-agent-${{ github.run_id }}.dir
+
+      - name: Build rootfs from the current agent
+        run: |
+          chmod +x examples/docker-compose/.state/ci-agent-${{ github.run_id }}.dir/smolvm-agent
+          AGENT_BINARY="$PWD/examples/docker-compose/.state/ci-agent-${{ github.run_id }}.dir/smolvm-agent" \
+            ./scripts/build-agent-rootfs.sh \
+              --arch aarch64 \
+              --no-build-agent \
+              examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
+          tar -cf examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.tar \
+            -C examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compose-rootfs-aarch64
+          path: examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.tar
+          if-no-files-found: error
+
+  verify:
+    name: Compose sockets, restart, and embedded release
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: build-rootfs
+    runs-on: [self-hosted, macOS, ARM64, hypervisor]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - name: Pull bundled runtime libraries
+        run: git lfs pull
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install host clients and image tools
+        run: brew install docker docker-compose e2fsprogs socat
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: compose-rootfs-aarch64
+          path: examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.download
+
+      - name: Extract guest rootfs
+        run: |
+          mkdir -p examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
+          tar -xf examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.download/ci-rootfs-${{ github.run_id }}.tar \
+            -C examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
+
+      - name: Build and sign SmolVM
+        run: |
+          LIBRARY_PATH="$PWD/lib" cargo build --release
+          codesign --force --sign - --entitlements smolvm.entitlements target/release/smolvm
+
+      - name: Run the one-command Compose verification
+        run: ./examples/docker-compose/verify.sh
+        env:
+          EXPORT_PACK: '1'
+          SMOLVM_AGENT_ROOTFS: ${{ github.workspace }}/examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
+          SMOLVM_LIB_DIR: ${{ github.workspace }}/lib
+          LIBKRUN_BUNDLE: ${{ github.workspace }}/lib
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docker-compose-runtime-darwin-arm64
+          path: examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine
+          if-no-files-found: error
+
+      - name: Remove workflow-owned state
+        if: always()
+        run: |
+          rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine
+          rm -rf -- examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.download
+          rm -rf -- examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir

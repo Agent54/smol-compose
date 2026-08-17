@@ -1374,6 +1374,69 @@ fn sync_and_unmount_storage() {
     // No-op on non-Linux platforms
 }
 
+/// Give persistent main workload containers a short, bounded graceful-stop
+/// window before the VM flushes and exits.
+///
+/// `machine stop` previously synced the disks while dockerd was still running,
+/// then terminated the VM process. That could interrupt Docker while it was
+/// updating `/storage/docker`, leaving the daemon unable to start after the VM
+/// restart. Signal every registered main container first, wait for all of them
+/// against one shared deadline, then force-delete only the survivors.
+#[cfg(target_os = "linux")]
+fn stop_main_containers_for_shutdown() {
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(4);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let Ok(overlays) = std::fs::read_dir(paths::OVERLAYS_DIR) else {
+        return;
+    };
+
+    let mut containers = Vec::new();
+    for overlay in overlays.flatten() {
+        let id_path = overlay.path().join("main_container_id");
+        let Ok(container_id) = std::fs::read_to_string(&id_path) else {
+            continue;
+        };
+        let container_id = container_id.trim().to_string();
+        if !container_id.is_empty() {
+            containers.push((container_id, id_path));
+        }
+    }
+
+    if containers.is_empty() {
+        return;
+    }
+
+    info!(
+        count = containers.len(),
+        "stopping main workload containers"
+    );
+    for (container_id, _) in &containers {
+        let _ = crun::CrunCommand::kill(container_id, "SIGTERM").status();
+    }
+
+    let deadline = std::time::Instant::now() + GRACE;
+    while std::time::Instant::now() < deadline
+        && containers
+            .iter()
+            .any(|(container_id, _)| is_container_running(container_id))
+    {
+        std::thread::sleep(POLL);
+    }
+
+    for (container_id, id_path) in containers {
+        if is_container_running(&container_id) {
+            warn!(%container_id, "main workload did not stop before shutdown deadline; forcing it");
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+        }
+        let _ = crun::CrunCommand::delete(&container_id, true).output();
+        let _ = std::fs::remove_file(id_path);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stop_main_containers_for_shutdown() {}
+
 /// Set up signal handlers to sync filesystem on SIGTERM/SIGINT.
 /// This prevents ext4 corruption when the VM is forcefully stopped.
 #[cfg(target_os = "linux")]
@@ -2277,7 +2340,10 @@ fn handle_request(
 
         AgentRequest::Shutdown => {
             info!("shutdown requested");
-            // Sync filesystem before shutdown to prevent corruption
+            // Stop persistent workloads before syncing. In particular, dockerd
+            // must flush its own metadata before the VM disk is torn down.
+            stop_main_containers_for_shutdown();
+            // Sync filesystem before shutdown to prevent corruption.
             sync_and_unmount_storage();
             AgentResponse::Ok {
                 data: Some(serde_json::json!({"shutdown": true})),

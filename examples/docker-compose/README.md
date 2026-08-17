@@ -30,6 +30,13 @@ unique machines it created after a successful run. Set `KEEP_STATE=1` to keep
 the machines and packed artifact for inspection. Set `SMOLVM=/path/to/smolvm`
 to test a distribution binary instead of `target/release/smolvm`.
 
+Set `EXPORT_PACK=1` to retain the verified sidecar at the fixed,
+platform-qualified path
+`examples/docker-compose/.state/docker-compose-runtime-<os>-<arch>.smolmachine`.
+The script still removes its unique test machines, sockets, launcher, staging
+directory, and logs. Tagged-release CI uses this mode to publish the exact
+sidecar that passed the embedded-artifact test.
+
 ## Requirements
 
 - a current SmolVM build whose libkrun includes block and virtio-net support;
@@ -207,6 +214,28 @@ The Docker socket endpoint, arbitrary socket endpoints, host mounts, and host po
 remain launch-site capabilities: the embedded application chooses their host
 paths when it creates the machine rather than baking machine-specific paths
 into the portable artifact.
+
+### Release asset boundary
+
+A tagged fork release publishes a platform-qualified Docker Compose
+`.smolmachine` alongside the normal SmolVM distribution. It does **not**
+publish or require a custom Docker OCI image: the official `docker:28-dind`
+image and its startup metadata are already embedded in the sidecar.
+
+An embedding application needs both release assets:
+
+- the normal platform distribution, which contains the signed `smolvm` host
+  executable, bundled `libkrun`/`libkrunfw`, agent rootfs, and disk templates;
+- the matching Docker Compose `.smolmachine`, which contains the Docker guest
+  image layers and workload configuration.
+
+For a macOS Apple Silicon Swift app, download the tagged `darwin-arm64`
+distribution and `smolvm-<version>-docker-compose-darwin-arm64.smolmachine`,
+verify both against `checksums.sha256`, and copy them into the app bundle. No
+Docker daemon, Docker.framework, Rust toolchain, or image build dependency is
+needed in the Swift app. The app only needs a small wrapper around the bundled
+runtime (for example an XPC service or `Process`) and chooses its socket and
+port paths when creating the machine.
 
 ## Stop without deleting state
 
