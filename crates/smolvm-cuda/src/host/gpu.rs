@@ -2703,8 +2703,8 @@ impl CudnnBackend {
                 let count = rd_i64(args, 16);
                 let mut elems = args[24..].to_vec();
                 if handle_bearing(ty) {
-                    for chunk in elems.chunks_exact_mut(8) {
-                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                    for chunk in elems.as_chunks_mut::<8>().0 {
+                        let h = u64::from_le_bytes(*chunk);
                         // VOID_PTR(6) = device pointer (fork-translate); HANDLE(0)
                         // / BACKEND_DESCRIPTOR(15) = opaque handle (vh_resolve).
                         let r = if ty == 6 {
@@ -2734,8 +2734,8 @@ impl CudnnBackend {
                 let seed = input.len().min(cap);
                 buf[..seed].copy_from_slice(&input[..seed]);
                 if handle_bearing(ty) {
-                    for chunk in buf[..seed].chunks_exact_mut(8) {
-                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                    for chunk in buf[..seed].as_chunks_mut::<8>().0 {
+                        let h = u64::from_le_bytes(*chunk);
                         let r = if ty == 6 {
                             dptr_resolve(h)
                         } else {
