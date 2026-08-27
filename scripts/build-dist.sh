@@ -365,6 +365,9 @@ fi
 # Copy libraries
 if [[ "$(uname -s)" == "Darwin" ]]; then
     cp "$WORK_LIB_DIR/libkrun.dylib" "$DIST_DIR/lib/"
+    if [[ -L "$WORK_LIB_DIR/libkrun.2.dylib" ]]; then
+        cp -a "$WORK_LIB_DIR/libkrun.2.dylib" "$DIST_DIR/lib/"
+    fi
     cp "$WORK_LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
     # Create symlink for compatibility
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"

@@ -133,7 +133,7 @@ echo "✓ libkrunfw ${FULL_VERSION} built and installed to lib/linux-${ARCH}/"
 ]
 
 [tasks.build-libkrun]
-description = "Build libkrun with BLK and GPU support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
+description = "Build libkrun with BLK, NET, and GPU support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
 category = "Build"
 script_runner = "bash"
 script = [
@@ -155,6 +155,9 @@ make -C libkrun BLK=1 NET=1 GPU=1
 if [ "$(uname -s)" = "Darwin" ]; then
   # macOS: the dylib lives in lib/ (alongside libkrunfw.5.dylib).
   cp libkrun/target/release/libkrun.dylib lib/libkrun.dylib
+  # libkrun 2.x records this versioned install name. Keep the on-disk alias
+  # beside the unversioned bundle entry so directly linked binaries can start.
+  ln -sfn libkrun.dylib lib/libkrun.2.dylib
   ./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
   echo "✓ libkrun built and copied to lib/libkrun.dylib"
 else
