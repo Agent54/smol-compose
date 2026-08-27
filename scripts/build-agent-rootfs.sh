@@ -122,7 +122,10 @@ install_packages_apk_static() {
     # Download Alpine's static apk binary — runs natively on Linux,
     # can install packages for any target architecture via --arch.
     APK_STATIC_MIRROR="${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/${HOST_ARCH}"
-    APK_STATIC_PKG=$(curl -fsSL "$APK_STATIC_MIRROR/" | grep -o 'apk-tools-static-[^"]*\.apk' | head -1)
+    # Read the complete index before selecting the first match. With pipefail,
+    # `grep | head -1` can fail with SIGPIPE as soon as head closes the pipe.
+    APK_STATIC_INDEX="$(curl -fsSL "$APK_STATIC_MIRROR/")"
+    APK_STATIC_PKG="$(grep -o 'apk-tools-static-[^"]*\.apk' <<<"$APK_STATIC_INDEX" | sed -n '1p' || true)"
     if [[ -z "$APK_STATIC_PKG" ]]; then
         echo "Error: could not find apk-tools-static package at $APK_STATIC_MIRROR"
         exit 1

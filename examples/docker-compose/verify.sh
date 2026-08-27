@@ -241,6 +241,13 @@ fi
 if [[ -z "${LIBKRUN_BUNDLE:-}" && -d "$STATE_DIR/build-lib" ]]; then
     export LIBKRUN_BUNDLE="$STATE_DIR/build-lib"
 fi
+if [[ "$PACK_HOST_OS" == "darwin" ]]; then
+    # macOS removes DYLD_* variables while starting this script through its
+    # /usr/bin/env shebang. Restore the selected bundle path here so a host
+    # binary linked to libkrun's versioned install name can start.
+    RUNTIME_LIB_DIR="${SMOLVM_LIB_DIR:-$REPO_ROOT/lib}"
+    export DYLD_LIBRARY_PATH="$RUNTIME_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+fi
 
 rm -f -- "$STATE_DIR/verify-h-${SOCKET_ID}.sock"
 rm -f -- "$STATE_DIR/verify-d-${SOCKET_ID}.sock"
