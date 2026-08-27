@@ -19,11 +19,13 @@ NORMAL_MACHINE="compose-verify-$RUN_ID"
 EMBEDDED_MACHINE="compose-embedded-$RUN_ID"
 NORMAL_PORT="${SMOLVM_COMPOSE_PORT:-18080}"
 EMBEDDED_PORT="${SMOLVM_COMPOSE_EMBEDDED_PORT:-18081}"
-HOST_SOCKET="$STATE_DIR/verify-h-$SOCKET_ID.sock"
-DOCKER_SOCKET="$STATE_DIR/verify-d-$SOCKET_ID.sock"
-VM_SOCKET="$STATE_DIR/verify-v-$SOCKET_ID.sock"
-EMBEDDED_DOCKER_SOCKET="$STATE_DIR/verify-ed-$SOCKET_ID.sock"
-EMBEDDED_VM_SOCKET="$STATE_DIR/verify-ev-$SOCKET_ID.sock"
+RUNTIME_STATE_DIR="$STATE_DIR"
+SHORT_STATE_LINK_CREATED=0
+HOST_SOCKET=""
+DOCKER_SOCKET=""
+VM_SOCKET=""
+EMBEDDED_DOCKER_SOCKET=""
+EMBEDDED_VM_SOCKET=""
 PACK_OUTPUT="$STATE_DIR/verify-pack-$SOCKET_ID.bin"
 PACK_STAGING="$STATE_DIR/verify-pack-$SOCKET_ID.staging"
 EMBEDDED_START_LOG="$STATE_DIR/verify-embedded-start-$SOCKET_ID.log"
@@ -117,6 +119,10 @@ cleanup() {
         rm -f -- "$STATE_DIR/verify-pack-${SOCKET_ID}.bin.smolmachine"
         rm -f -- "$STATE_DIR/verify-embedded-start-${SOCKET_ID}.log"
         rm -rf -- "$STATE_DIR/verify-pack-${SOCKET_ID}.staging"
+    fi
+
+    if [[ "$SHORT_STATE_LINK_CREATED" == 1 ]]; then
+        rm -f -- "/tmp/smolvm-compose-state-${SOCKET_ID}.link"
     fi
 
     if [[ "$SUCCESS" != 1 ]]; then
@@ -213,10 +219,30 @@ fi
 
 [[ -x "$SMOLVM_BIN" ]] || fail "smolvm binary not found: $SMOLVM_BIN"
 
-# A project-local state root is intentionally used. Fail before boot with a
-# useful explanation if this checkout is so deeply nested that macOS cannot
-# represent libkrun's per-VM Unix control socket.
+# Keep all state physically below the ignored example directory. When a CI
+# checkout makes that physical path too long for macOS AF_UNIX, address it
+# through one short symlink in /tmp. SmolVM preserves an explicit macOS data
+# root rather than canonicalizing it, so libkrun receives the short spelling
+# while every created file and socket still lands in STATE_DIR.
 CONTROL_PROBE="$STATE_DIR/0000000000000000/control.sock"
+if [[ "$PACK_HOST_OS" == "darwin" ]] && (( ${#CONTROL_PROBE} >= 104 )); then
+    SHORT_STATE_LINK="/tmp/smolvm-compose-state-${SOCKET_ID}.link"
+    if [[ -e "$SHORT_STATE_LINK" || -L "$SHORT_STATE_LINK" ]]; then
+        fail "short state alias already exists: $SHORT_STATE_LINK"
+    fi
+    ln -s "$STATE_DIR" "$SHORT_STATE_LINK"
+    RUNTIME_STATE_DIR="$SHORT_STATE_LINK"
+    SHORT_STATE_LINK_CREATED=1
+    printf 'Using short macOS socket alias %s -> %s\n' "$RUNTIME_STATE_DIR" "$STATE_DIR"
+fi
+
+HOST_SOCKET="$RUNTIME_STATE_DIR/verify-h-$SOCKET_ID.sock"
+DOCKER_SOCKET="$RUNTIME_STATE_DIR/verify-d-$SOCKET_ID.sock"
+VM_SOCKET="$RUNTIME_STATE_DIR/verify-v-$SOCKET_ID.sock"
+EMBEDDED_DOCKER_SOCKET="$RUNTIME_STATE_DIR/verify-ed-$SOCKET_ID.sock"
+EMBEDDED_VM_SOCKET="$RUNTIME_STATE_DIR/verify-ev-$SOCKET_ID.sock"
+CONTROL_PROBE="$RUNTIME_STATE_DIR/0000000000000000/control.sock"
+
 if (( ${#CONTROL_PROBE} >= 104 )); then
     fail "SMOLVM_DATA_DIR is too long for a macOS Unix socket (${#CONTROL_PROBE} bytes): $CONTROL_PROBE"
 fi
@@ -231,7 +257,7 @@ for socket_path in \
     fi
 done
 
-export SMOLVM_DATA_DIR="$STATE_DIR"
+export SMOLVM_DATA_DIR="$RUNTIME_STATE_DIR"
 if [[ -z "${SMOLVM_AGENT_ROOTFS:-}" && -d "$REPO_ROOT/target/agent-rootfs" ]]; then
     export SMOLVM_AGENT_ROOTFS="$REPO_ROOT/target/agent-rootfs"
 fi

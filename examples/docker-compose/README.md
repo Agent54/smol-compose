@@ -40,6 +40,12 @@ unique machines it created after a successful run. Set `KEEP_STATE=1` to keep
 the machines and packed artifact for inspection. Set `SMOLVM=/path/to/smolvm`
 to test a distribution binary instead of `target/release/smolvm`.
 
+On macOS CI checkouts whose absolute path would exceed the Unix-socket limit,
+the script temporarily addresses that same `.state` directory through a short,
+PID-scoped symlink in `/tmp`. The symlink is removed on exit; all state and
+socket filesystem objects remain physically inside the ignored `.state`
+directory.
+
 Set `EXPORT_PACK=1` to retain the verified sidecar at the fixed,
 platform-qualified path
 `examples/docker-compose/.state/docker-compose-runtime-<os>-<arch>.smolmachine`.
