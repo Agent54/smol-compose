@@ -21,6 +21,7 @@ fn main() {
         persistent: false,
         runtime_managed: false,
         labels: Default::default(),
+        ..MachineSpec::default()
     });
     rt.start_machine(name).expect("start");
     // small output: works
