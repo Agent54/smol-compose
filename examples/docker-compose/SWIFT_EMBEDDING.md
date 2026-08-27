@@ -31,6 +31,20 @@ Verify both artifacts against `checksums.sha256`. The normal distribution and
 the Compose sidecar must come from the same release. Do not download `latest`
 when the application starts.
 
+The current complete, immutable integration prerelease is
+[`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1).
+It contains all three files above. Its expected artifact digests are:
+
+```text
+93dccc758df880a707f53fcb62ca393fea7538f07361280fb0dcc4c12323b714  smolvm-1.13.0-darwin-arm64.tar.gz
+acaa84066ca78f07d47a7e1358e12e90ac6f5b54b6c3344b5bd98d343e26b9bc  smolvm-1.13.0-docker-compose-darwin-arm64.smolmachine
+```
+
+This is a manually produced integration prerelease, not a production `v*`
+release. Pin its exact tag and hashes for integration work. The earlier
+`compose-integration-1.13.0-1706c07` prerelease contains only the sidecar and
+must not be used as the complete app-bundle input.
+
 After verifying the versioned sidecar, copy it into the application bundle as
 `docker-compose.smolmachine`. All paths and Swift examples below use that stable
 bundled name. An application that preserves the versioned release filename must
@@ -51,10 +65,18 @@ MyManager.app/
       |- overlay-template.ext4
       |- lib/
       |  |- libkrun.dylib
+      |  |- libkrun.2.dylib -> libkrun.dylib
       |  |- libkrunfw.5.dylib
-      |  `- libkrunfw.dylib -> libkrunfw.5.dylib
+      |  |- libkrunfw.dylib -> libkrunfw.5.dylib
+      |  |- libepoxy.0.dylib
+      |  |- libvirglrenderer.1.dylib
+      |  `- libMoltenVK.dylib
       `- docker-compose.smolmachine
 ```
+
+Preserve the whole extracted distribution rather than selecting individual
+dylibs. In particular, `smolvm-bin` is linked against the versioned
+`libkrun.2.dylib` name; omitting that symlink prevents the helper from starting.
 
 Both release assets are required. The distribution contains the macOS runtime,
 the agent rootfs, disk templates, and the fork's pinned libkrun build compiled
@@ -97,6 +119,11 @@ process.environment = [
     "DYLD_LIBRARY_PATH": runtime.appendingPathComponent("lib").path,
 ]
 ```
+
+Create `state`, `state/tmp`, `state/sockets`, and `state/projects` before the
+first command. Use permissions `0700` for the private state and socket
+directories. Because the app invokes `smolvm-bin` directly, keep
+`DYLD_LIBRARY_PATH` pointed at the bundled `lib/` directory on every call.
 
 Serialize create, start, stop, update, and delete operations in a Swift actor.
 When stdout and stderr use pipes, drain both concurrently so a full pipe cannot
@@ -146,7 +173,26 @@ shutdown.
 One Docker machine can host multiple Compose projects. Assign every project a
 stable, unique Compose project name.
 
-On first launch, execute the equivalent of:
+The smallest dependency-free setup needs only the embedded sidecar, outbound
+VM networking, and the app-owned project mount:
+
+```sh
+smolvm-bin machine create \
+  --name mymanager-docker \
+  --from /path/to/SmolRuntime/docker-compose.smolmachine \
+  --net-backend virtio-net \
+  --volume /path/to/SmolState/projects:/workspace/projects \
+  --label com.example.owner=mymanager
+```
+
+Use this minimal form when Swift controls Compose exclusively with `machine
+exec`. Add `--port`, `--mount-socket`, and `--expose-socket` only for concrete
+application capabilities. Project container images are not part of the Docker
+runtime sidecar, so `virtio-net` also lets Compose pull those images on first
+use.
+
+For an application that needs the validated host port and both arbitrary socket
+directions, execute the equivalent of:
 
 ```sh
 smolvm-bin machine create \
@@ -221,6 +267,33 @@ smolvm-bin machine exec --name mymanager-docker -- docker compose version
 
 The packed Docker image contains the Compose v2 CLI plugin, so the Swift app
 does not need a host `docker` or `docker-compose` executable.
+The published integration sidecar was checked directly and reports Docker
+Compose v2.40.3.
+
+## Minimal Swift integration sequence
+
+The Swift-app agent can implement the first working integration in this order:
+
+1. During the app build, download the exact three release files above and
+   verify both payloads with the pinned SHA-256 values.
+2. Extract the runtime archive into `Contents/Helpers/SmolRuntime`, preserve its
+   entire layout, and copy the sidecar there as `docker-compose.smolmachine`.
+3. At runtime, create the private application state directories and implement
+   one `Foundation.Process` runner with the environment shown above.
+4. Call `machine ls --json`; if the owned machine is absent, issue the minimal
+   `machine create` command. Do not recreate an existing machine during normal
+   startup.
+5. Call `machine start`, then poll `machine exec -- docker info` until dockerd
+   is ready. Check `machine exec -- docker compose version` once as an install
+   compatibility assertion.
+6. Put each Compose project below the mounted `projects` directory and run
+   `docker compose up` through `machine exec` as shown below.
+7. Use `machine stop` for normal shutdown. Reserve `machine delete` and Compose
+   `down --volumes` for explicit destructive user actions.
+
+That path uses only Foundation and the bundled release files. An XPC service,
+host Docker socket, arbitrary socket bridges, and host port mappings can be
+added later without changing the packaged Docker runtime.
 
 ## Run Compose projects
 

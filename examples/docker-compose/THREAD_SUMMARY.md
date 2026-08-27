@@ -1,262 +1,107 @@
-# Agent handoff: non-obvious context
+# Agent handoff: Docker Compose embedding
 
-Read this before continuing work on this example. It records conversation and
-workspace context that is not reliably inferable from the repository source or
-the example documentation.
+This is the current handoff for an agent integrating the Compose backend into
+a macOS Apple Silicon Swift application. Historical feasibility details were
+removed because they described SmolVM 1.7.5 and predated the maintained,
+release-tested implementation.
 
-## User intent and working constraints
+## Ready-to-use integration release
 
-The end goal is a Docker Compose backend embedded in a macOS Apple Silicon
-Swift application. The application must ship everything it needs; end users
-must not install SmolVM, Homebrew packages, a Docker daemon, or build tools.
+Use the complete immutable prerelease:
 
-The user has specifically asked for:
+[`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1)
 
-- host TCP ports published through the VM to Compose containers;
-- a dedicated, user-selected host project directory mounted into the VM and
-  usable as a Compose bind-mount source;
-- arbitrary Unix sockets proxied host-to-VM and VM-to-host;
-- persistent Docker images, containers, volumes, and project data;
-- a reviewable GitHub fork/release workflow suitable for eventual upstream PRs;
-- simple, individually reviewable commands, with no wrapper shell scripts,
-  chained shell logic, hidden cleanup, or destructive host operations.
+Download all three assets from that release:
 
-Runtime source changes require explicit user authorization. The current work
-was explicitly authorized to add bidirectional Unix-socket support to embedded
-machine records and to make Docker auto-start as the image workload. At the
-start of the example move, the SmolVM worktree was clean.
+- `smolvm-1.13.0-darwin-arm64.tar.gz`
+- `smolvm-1.13.0-docker-compose-darwin-arm64.smolmachine`
+- `checksums.sha256`
 
-Do not automatically start, stop, delete, or recreate the user's existing VM.
-Show any mutating commands plainly and let the user review them first unless
-they explicitly ask the agent to execute them.
+The runtime archive SHA-256 is
+`93dccc758df880a707f53fcb62ca393fea7538f07361280fb0dcc4c12323b714`.
+The Compose sidecar SHA-256 is
+`acaa84066ca78f07d47a7e1358e12e90ac6f5b54b6c3344b5bd98d343e26b9bc`.
+The older tag without the `.1` suffix contains only the sidecar and is not a
+complete Swift embedding input.
 
-## Workspace layout and Git state
+## Minimal Swift architecture
 
-The workspace root is:
+Use the process boundary documented in [`SWIFT_EMBEDDING.md`](SWIFT_EMBEDDING.md):
 
 ```text
-/Users/jan/Dev/xe/microsandbox
+Swift actor or XPC service
+  -> Foundation.Process
+  -> bundled smolvm-bin
+  -> bundled Docker Compose .smolmachine
+  -> dockerd and docker compose inside the Linux VM
 ```
 
-Neither the workspace root nor its `smol/` directory is a Git repository. The
-actual SmolVM repository is:
+There is no required Swift package, Docker SDK, Docker Desktop, host Docker
+daemon, Homebrew dependency, Rust toolchain, or runtime image build. Invoke
+`smolvm-bin` directly with an argument array and the bundled runtime paths in
+its environment. Do not use a shell command string.
 
-```text
-/Users/jan/Dev/xe/microsandbox/smol/smolvm
-```
+For the first integration, create the machine from the sidecar with only
+`--net-backend virtio-net` and the app-owned project-directory volume. Control
+Compose through `machine exec -- docker compose ...`. The sidecar contains
+Docker Compose v2.40.3. Add host ports and socket bridges only when the app has
+a concrete need for them.
 
-The root-level Deno files, `test.ts`, `node_modules`, `test/`, and the separate
-`microsandbox-latest/` checkout belong to the competing Microsandbox
-evaluation. They are not the Swift application and should not be used as the
-implementation to extend.
+## Asset boundary
 
-The durable Smol evaluation files previously lived directly under `smol/`.
-They were moved into this example. Generated state remains under `smol/.state`
-and must not be committed. It was approximately 4 GiB when inspected.
+The normal runtime archive supplies:
 
-At the time this summary was created, the intended SmolVM worktree changes
-were only example/documentation changes:
+- the signed/ad-hoc-signed `smolvm-bin` host executable and wrapper;
+- the static ARM64 Linux 1.13.0 agent rootfs;
+- storage and overlay templates;
+- the pinned NET-enabled libkrun runtime and its dependencies.
 
-```text
-M  examples/README.md
-M  examples/docker-in-vm/docker.smolfile
-?? examples/docker-compose/
-```
+Preserve the extracted layout. `lib/libkrun.2.dylib` is a required symlink to
+`libkrun.dylib`; selecting only unversioned dylibs will break process startup.
 
-No commit has been created. Recheck `git status --short` before doing further
-work because the user may have changed the tree after this handoff.
+The Compose sidecar supplies the official `docker:28-dind` image layers and
+workload configuration. It is not a custom OCI image asset. The DinD
+entrypoint starts dockerd automatically on every VM start, using
+`/storage/docker` on the persistent ext4 disk.
 
-## Existing locally working runtime
+## Runtime capabilities
 
-The successful feasibility run used a hybrid runtime:
+The maintained implementation supports:
 
-- host CLI from SmolVM `main` commit
-  `e2e04fa1d55190bc7fd4144b5bae29b3d870b8d4`;
-- Linux agent/rootfs from released SmolVM 1.7.5;
-- locally built libkrun commit
-  `3ca804246b584d8024f95fd3e8ca48daa3e38800` with `BLK=1 NET=1 GPU=0`;
-- existing machine name `smol-compose-dev`.
+- host TCP forwarding through the VM to Compose containers;
+- `/var/run/docker.sock` exposed from the guest to an optional host client;
+- arbitrary host-to-guest Unix sockets with `--mount-socket HOST:GUEST`;
+- arbitrary guest-to-host Unix sockets with `--expose-socket GUEST:HOST`;
+- persistent Docker images, containers, volumes, and project state;
+- automatic dockerd restart with the VM; and
+- machine creation from the sidecar without pulling `docker:28-dind`.
 
-The local runtime paths used for that successful machine were:
+Compose bind-source paths are resolved by the daemon inside the VM. Mount the
+app-owned macOS project directory into the VM, then use guest paths such as
+`/workspace/projects/web-stack/data` in Compose files.
 
-```text
-HOME=/Users/jan/Dev/xe/microsandbox/smol/.state/d
-DYLD_LIBRARY_PATH=/Users/jan/Dev/xe/microsandbox/smol/.state/dev-lib
-SMOLVM_AGENT_ROOTFS=/Users/jan/Dev/xe/microsandbox/smol/.state/release-home/Library/Application Support/smolvm/agent-rootfs
-SMOLVM=/Users/jan/Dev/xe/microsandbox/smol/smolvm/target/release/smolvm
-```
+## Safety constraints
 
-Do not assume the existing machine is currently running or healthy. Inspect it
-using the same environment before interpreting its state. Do not mix the
-default host HOME with this short HOME: SmolVM will look in a different machine
-database and report that the machine does not exist or is stopped.
+- Keep `SMOLVM_DATA_DIR` short because macOS Unix socket paths are limited to
+  roughly 104 bytes.
+- Put app sockets below a private mode-`0700` directory.
+- Delete only enumerated app-owned socket suffixes and exact machine names.
+- Treat access to the Docker socket as control of the VM and its host mounts.
+- Serialize machine lifecycle changes in a Swift actor or XPC service.
+- Drain child stdout and stderr concurrently.
+- Keep destructive operations such as `machine delete` and Compose
+  `down --volumes` behind explicit user actions.
 
-The new documented example uses the distinct name
-`docker-compose-evaluation`. It was run end-to-end after the files were moved,
-including a stop/start cycle and a second run from a freshly built
-`.smolmachine` artifact.
+## Repository and CI state
 
-## Failure history and correct interpretations
+The fork is `Agent54/smol-compose`. The `compose` branch is based on current
+upstream SmolVM 1.13.0 and points at `1706c07`; runtime changes are in
+`c3a9fcc`, while `1706c07` changes only Compose CI bootstrap.
 
-These points consumed significant debugging time and should not be rediscovered
-from scratch:
-
-1. Released SmolVM 1.7.5's macOS libkrun lacked
-   `krun_add_net_unixstream`. TSI could provide outbound networking but could
-   not publish host ports. A libkrun build with `NET=1` was required for
-   virtio-net.
-2. Building libkrun without the Rust target
-   `aarch64-unknown-linux-musl` caused the fallback init build to embed a macOS
-   Mach-O executable in the guest. The VM then exited with code 0 before the
-   agent became ready. LLVM's `libclang.dylib` and `lld` were also needed for
-   the local libkrun build.
-3. macOS Unix-socket paths exceeded `SUN_LEN`. Setting only
-   `SMOLVM_CONTROL_SOCKET` did not solve every socket because the agent socket
-   was still derived from SmolVM's data/cache path. A real short HOME fixed the
-   problem. A symlink to a long directory did not help because paths were
-   canonicalized.
-4. `krun_start_enter` returning `-22` occurred after unclean/unreachable VM
-   state and can mean a held or invalid disk/configuration. Do not immediately
-   delete disks; first verify the old VM process has fully exited and that the
-   same HOME/runtime is being used.
-5. `curl: connection reset by peer` was observed when no Compose container was
-   running. `docker ps` was empty, so that error was not evidence that outer
-   port forwarding had failed.
-6. Detached `dockerd` initially returned a PID but immediately failed because
-   `/var/lib/docker` was no longer bound to ext4. Detached exec itself was not
-   the problem.
-7. The one-time init commands did not run again after VM restart. `/run` is
-   tmpfs, mount namespaces are recreated, and background processes do not
-   survive a VM stop. The working recovery was to reapply the ext4 bind and
-   relaunch `dockerd`. This example now avoids the bind entirely by using
-   `--data-root=/storage/docker`.
-8. `e2fsprogs` was required on the development host only because the installed
-   1.7.5 runtime lacked preformatted storage templates. SmolVM's current
-   release builder creates compressed storage and overlay templates. A final
-   embedded distribution should bundle those and must not require end-user
-   `mkfs.ext4`.
-
-## Docker and Compose behavior that matters
-
-There are two separate port-publishing layers:
-
-```text
-container port -> VM port -> macOS host port
-```
-
-Compose publishes the first layer. SmolVM must declare the second layer when
-the machine is created. Ports dynamically selected later by Compose or
-Testcontainers are not automatically exposed across the outer VM boundary.
-
-When host Compose talks to the guest daemon through `DOCKER_HOST`, Docker bind
-sources are resolved by the daemon inside the VM. Therefore the Compose file
-uses `/workspace/smol/docker-compose/fixtures/...`, not the corresponding
-macOS path. The host fixture directory reaches that guest location through
-SmolVM virtiofs.
-
-SmolVM host mounts accept directories, not individual files. Compose may still
-bind individual files or subdirectories from the mounted guest directory into
-containers.
-
-The socket directions are easy to confuse:
-
-- `--mount-socket HOST:GUEST` makes a host-listening Unix socket available to
-  guest applications;
-- `--expose-socket GUEST:HOST` makes a guest-listening Unix socket available to
-  host applications;
-- `--docker-socket` is the specialized guest-to-host bridge for the guest's
-  `/var/run/docker.sock`; it does not expose the host Docker daemon to the VM.
-
-A normal virtiofs directory mount does not proxy Unix-socket semantics. Socket
-files require the explicit vsock-backed socket bridge.
-
-Docker state belongs directly on `/storage/docker`, the VM's persistent ext4
-disk. The root filesystem is already overlayfs, so Docker `overlay2` must not
-place its upper layers there.
-
-Automatic daemon startup is handled by making `docker:28-dind` the persistent
-image workload. SmolVM relaunches its entrypoint on every VM start; the example
-passes an explicit Unix-only `dockerd` command and keeps Docker state on
-`/storage/docker`.
-
-## SDK, API, and Swift integration findings
-
-There is currently no official Swift SDK, stable C ABI, Swift package, or
-XCFramework for SmolVM.
-
-The public `smolmachines` embedded SDK targets Node/TypeScript and Python. Its
-documented local configuration covers mounts and ports but does not expose the
-complete socket functionality needed by this backend. In the evaluated source:
-
-- the Rust embedded machine record now persists the Docker socket and generic
-  `mount-socket` / `expose-socket` configuration used by the launcher;
-- the REST create API exposed `dockerSocket` but not arbitrary published
-  sockets;
-- the CLI was the only complete interface for both arbitrary socket
-  directions.
-
-The local `smolvm serve` REST API is not normally authenticated. A protected
-Unix socket limits access by filesystem/process boundaries, and development
-source contains optional fleet mTLS, but there is no per-machine token or RBAC.
-Anyone able to call the machine API can control the VM capabilities granted to
-the SmolVM process.
-
-The practical Swift recommendation was therefore:
-
-- bundle a signed `smolvm` helper, compatible libkrun/libkrunfw, agent rootfs,
-  disk templates, and a Docker-capable guest artifact inside one `.app`;
-- invoke the helper with Swift `Process` and an argument array—never shell
-  command strings;
-- keep VM operations behind a typed Swift actor;
-- optionally place that controller behind a signed XPC service when crash
-  isolation, background lifetime, or untrusted UI/plugin code requires it;
-- do not expose `smolvm serve` merely to connect the Swift UI;
-- give only the process that invokes Hypervisor.framework the
-  `com.apple.security.hypervisor` entitlement;
-- use security-scoped bookmarks for a user-selected dedicated project folder
-  and retain access for the lifetime of the VM mount.
-
-Literal same-process Swift embedding would require a new Rust C ABI and an
-XCFramework. That is possible but would be a maintained fork surface and was
-not recommended as the first production integration.
-
-## GitHub and release direction
-
-The proposed repository boundary is:
-
-- a small fork of `smol-machines/smolvm` containing only reusable runtime,
-  tests, examples, API parity, and release packaging;
-- a separate Swift application repository containing the XPC/Process wrapper,
-  app entitlements, user-folder policy, Compose orchestration, and app bundle
-  assembly.
-
-The Swift app CI should download an exact tagged release from the fork, verify
-a committed SHA-256, stage the runtime into the app, sign nested code, then sign
-and notarize the outer application. It should never consume `latest` or build
-Rust/libkrun during the app bundle job.
-
-Potential upstream work should be split into reviewable PRs:
-
-1. Docker/Compose example and integration coverage;
-2. generic agent-managed guest services for boot/restart;
-3. REST and embedded-SDK parity for Docker and arbitrary socket bridges;
-4. an optional Docker/Compose guest artifact, rather than adding Docker to
-   every base agent rootfs.
-
-Do not put Swift application code or app-specific policy into the SmolVM fork.
-
-## Verification status of this moved example
-
-The original external fixture passed end-to-end. After moving and improving it:
-
-- `git diff --check` passed;
-- documented paths were reviewed for the new example location;
-- the fixture now uses direct Docker data-root and Compose
-  `restart: unless-stopped`;
-- the guest fixture removes only its own known socket path before rebinding;
-- a requested `docker-compose ... config` verification command was declined by
-  the host and was not retried;
-- the moved example has not yet been rerun against the VM.
-
-Before claiming that the new example works, run the documented flow with user
-approval and record the exact SmolVM/libkrun/agent versions used.
+Local build, unit-test, Clippy, libkrun provenance, socket, restart, pack, and
+embedded-artifact checks passed. The GitHub-hosted CI for the rebased runtime
+passed. The self-hosted Compose job is currently an infrastructure issue: its
+runner cannot install or locate Homebrew/Git LFS during checkout. The complete
+integration prerelease was therefore built and validated manually. Swift app
+integration should consume the immutable release and does not need to wait for
+that runner repair.
