@@ -2,13 +2,13 @@ name: Docker Compose integration
 
 # This test boots real Apple Silicon microVMs. GitHub-hosted macOS runners do
 # not expose Hypervisor.framework to nested guests, so the final job requires a
-# self-hosted Apple Silicon runner with the additional `hypervisor` label.
+# self-hosted Apple Silicon runner with the additional `raw` label.
 # Never run fork PR code on that persistent host.
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [compose]
     paths:
       - '.github/workflows/docker-compose.yml'
       - 'Cargo.lock'
@@ -20,7 +20,7 @@ on:
       - 'scripts/build-agent-rootfs.sh'
       - 'src/**'
   pull_request:
-    branches: [main]
+    branches: [compose]
     paths:
       - '.github/workflows/docker-compose.yml'
       - 'Cargo.lock'
@@ -101,7 +101,7 @@ jobs:
     name: Compose sockets, restart, and embedded release
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: build-rootfs
-    runs-on: [self-hosted, macOS, ARM64, hypervisor]
+    runs-on: [self-hosted, macOS, ARM64, raw]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6

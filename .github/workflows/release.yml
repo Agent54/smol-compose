@@ -505,7 +505,7 @@ jobs:
   build-compose-runtime:
     name: Verify Docker Compose release asset (darwin-arm64)
     needs: build-dist
-    runs-on: [self-hosted, macOS, ARM64, hypervisor]
+    runs-on: [self-hosted, macOS, ARM64, raw]
     timeout-minutes: 45
     concurrency:
       group: docker-compose-hypervisor
