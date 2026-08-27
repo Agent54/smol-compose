@@ -9,6 +9,12 @@ For a dependency-free macOS application integration that embeds the released
 runtime and runs Compose inside the VM, see
 [`SWIFT_EMBEDDING.md`](SWIFT_EMBEDDING.md).
 
+The current complete Apple Silicon integration prerelease is
+[`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1).
+It contains the matching SmolVM 1.13.0 Darwin ARM64 distribution, the verified
+Docker Compose `.smolmachine`, and checksums for both. The older prerelease
+without the `.1` suffix is sidecar-only and is not a complete embedding input.
+
 It validates all of the paths needed by a local Compose backend:
 
 - a host TCP port forwarded through the VM to a Compose container;
