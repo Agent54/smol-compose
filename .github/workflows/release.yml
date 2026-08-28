@@ -588,6 +588,7 @@ jobs:
           name: dist-compose-runtime
           path: examples/docker-compose/.state/smolvm-*-docker-compose-darwin-arm64.smolmachine
           if-no-files-found: error
+          include-hidden-files: true
 
       - name: Remove workflow-owned state
         if: always()
