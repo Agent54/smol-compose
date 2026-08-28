@@ -3,15 +3,35 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A manual release is only for the Compose branch. Normal v* tag pushes keep
+  # the upstream release path unchanged.
+  validate-release:
+    name: Validate release trigger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the Compose branch for manual releases
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "$GITHUB_REF" != 'refs/heads/compose' ]]; then
+            echo "error: manually dispatched Compose releases must run from the compose branch" >&2
+            exit 1
+          fi
+
   # ==========================================================================
   # Run CI checks first
   # ==========================================================================
   ci:
+    needs: validate-release
     uses: ./.github/workflows/ci.yml
 
   # ==========================================================================
@@ -584,10 +604,71 @@ jobs:
     name: Create Release
     needs: [build-dist, build-dist-windows, build-compose-runtime]
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release_tag.outputs.tag }}
+      is_compose: ${{ steps.release_tag.outputs.is_compose }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release_tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            git fetch --force origin '+refs/tags/*:refs/tags/*'
+
+            version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+            if [[ -z "$version" ]]; then
+              echo "error: could not read the mainline package version from Cargo.toml" >&2
+              exit 1
+            fi
+            base_tag="v$version"
+            if ! git ls-remote --exit-code --tags \
+              https://github.com/smol-machines/smolvm.git \
+              "refs/tags/$base_tag" >/dev/null; then
+              echo "error: mainline tag does not exist upstream: $base_tag" >&2
+              exit 1
+            fi
+
+            max_counter=0
+            while IFS= read -r candidate; do
+              counter="${candidate#"${base_tag}-compose_"}"
+              if [[ "$counter" =~ ^[0-9]+$ ]]; then
+                counter_value=$((10#$counter))
+                if (( counter_value > max_counter )); then
+                  max_counter=$counter_value
+                fi
+              fi
+            done < <(git tag --list "${base_tag}-compose_*")
+
+            tag="${base_tag}-compose_$((max_counter + 1))"
+            if git show-ref --verify --quiet "refs/tags/$tag"; then
+              echo "error: computed release tag already exists: $tag" >&2
+              exit 1
+            fi
+
+            is_compose=true
+          else
+            tag="$PUSH_TAG"
+            case "$tag" in
+              v*) ;;
+              *) echo "error: release tag must start with v: $tag" >&2; exit 1 ;;
+            esac
+            case "$tag" in
+              *-compose_*) is_compose=true ;;
+              *) is_compose=false ;;
+            esac
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "is_compose=$is_compose" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag"
 
       - name: Download all dist artifacts
         uses: actions/download-artifact@v8
@@ -608,10 +689,23 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+          IS_COMPOSE: ${{ steps.release_tag.outputs.is_compose }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "smolvm ${{ github.ref_name }}" \
+          release_flags=()
+          if [[ "$IS_COMPOSE" == 'true' ]]; then
+            release_flags+=(--prerelease)
+          fi
+          tag_flags=(--verify-tag)
+          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            tag_flags=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$RELEASE_TAG" \
+            "${tag_flags[@]}" \
+            --title "smolvm $RELEASE_TAG" \
             --generate-notes \
+            "${release_flags[@]}" \
             dist/*.tar.gz \
             dist/*.zip \
             dist/*.smolmachine \
@@ -623,9 +717,10 @@ jobs:
       # within a few hours anyway) and never fails the release. The token is a
       # fine-grained PAT with Contents:write on smol-machines/homebrew-tap.
       - name: Notify Homebrew tap of the new release
+        if: steps.release_tag.outputs.is_compose != 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "HOMEBREW_TAP_DISPATCH_TOKEN not set — skipping instant bump (the tap polls on a schedule)."
@@ -643,6 +738,7 @@ jobs:
   publish-package-repositories:
     name: Publish package repositories
     needs: release
+    if: needs.release.outputs.is_compose != 'true'
     permissions:
       actions: read
       contents: read
@@ -650,7 +746,7 @@ jobs:
       id-token: write
     uses: ./.github/workflows/pacman-repo.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.release.outputs.tag }}
 
   # Bump the Nix flake (nix/smolvm.nix) to this release and open a PR. Same
   # reasoning as the steps above (the `release: published` event never fires for
@@ -658,9 +754,10 @@ jobs:
   update-nix-flake:
     name: Update Nix flake
     needs: release
+    if: needs.release.outputs.is_compose != 'true'
     permissions:
       contents: write
       pull-requests: write
     uses: ./.github/workflows/update-nix-flake.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.release.outputs.tag }}
