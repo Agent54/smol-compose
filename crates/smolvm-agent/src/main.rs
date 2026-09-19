@@ -325,8 +325,8 @@ fn main() {
     #[cfg(target_os = "linux")]
     setup_kvm_dev_node();
 
-    // Set up persistent rootfs overlay (if /dev/vdb exists).
-    // This does overlayfs + pivot_root before anything else touches the filesystem.
+    // Set up persistent rootfs overlay (if /dev/vdb exists). Runtime-only
+    // directories are reset and mounted as tmpfs before pivot_root completes.
     setup_persistent_rootfs();
     forkpoint::setup();
     boot_log(
@@ -1107,6 +1107,52 @@ fn ensure_mount_dir(path: &str) {
     }
 }
 
+/// Remove everything from a directory that must contain runtime-only state.
+///
+/// The persistent root overlay intentionally survives machine restarts, but
+/// `/run` and `/tmp` must not. Resetting their backing directories before
+/// mounting tmpfs also gives a clean fallback if the tmpfs mount itself fails.
+#[cfg(any(target_os = "linux", test))]
+fn reset_ephemeral_directory(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::create_dir_all(path)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_ephemeral_directory(path: &std::path::Path, mode: &str) -> Result<(), String> {
+    reset_ephemeral_directory(path)
+        .map_err(|error| format!("failed to reset {}: {}", path.display(), error))?;
+
+    let source = cstr("tmpfs");
+    let target = cstr(&path.to_string_lossy());
+    let fstype = cstr("tmpfs");
+    let data = cstr(&format!("mode={mode}"));
+    // SAFETY: every pointer refers to a live CString for the duration of mount.
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to mount tmpfs at {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
 /// Set up persistent rootfs overlay using overlayfs on /dev/vdb.
 ///
 /// If /dev/vdb exists (overlay disk attached by host), this function:
@@ -1368,6 +1414,16 @@ fn setup_persistent_rootfs() {
             libc::MS_PRIVATE | libc::MS_REC,
             std::ptr::null(),
         );
+    }
+
+    // Runtime state must never be inherited through the persistent root
+    // overlay. In particular, stale Docker/containerd PID files and sockets in
+    // /run can prevent dockerd from starting after an unclean VM shutdown.
+    for (directory, mode) in [("run", "0755"), ("tmp", "1777")] {
+        let path = std::path::PathBuf::from(format!("{NEWROOT}/{directory}"));
+        if let Err(error) = mount_ephemeral_directory(&path, mode) {
+            boot_log("WARN", &error);
+        }
     }
 
     // Create mount point directories in new root and move special mounts
@@ -7511,6 +7567,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn reset_ephemeral_directory_removes_stale_runtime_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        let stale = run.join("docker/containerd");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("containerd.pid"), "77\n").unwrap();
+        std::os::unix::fs::symlink("missing.sock", run.join("docker.sock")).unwrap();
+
+        reset_ephemeral_directory(&run).unwrap();
+
+        assert!(run.is_dir());
+        assert_eq!(std::fs::read_dir(&run).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn reset_ephemeral_directory_does_not_follow_a_stale_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let persistent = temp.path().join("persistent");
+        std::fs::create_dir_all(&persistent).unwrap();
+        std::fs::write(persistent.join("keep"), "data").unwrap();
+        let run = temp.path().join("run");
+        std::os::unix::fs::symlink(&persistent, &run).unwrap();
+
+        reset_ephemeral_directory(&run).unwrap();
+
+        assert!(run.is_dir());
+        assert_eq!(std::fs::read_dir(&run).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_to_string(persistent.join("keep")).unwrap(),
+            "data"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
