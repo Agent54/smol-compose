@@ -15,7 +15,7 @@ use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
-use smolvm_protocol::ImageInfo;
+use smolvm_protocol::{ImageInfo, MemoryStatus, WorkloadStatus};
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -2824,10 +2824,15 @@ fn print_memory_usage(manager: &AgentManager) {
 
 /// Build the per-machine JSON object shared by `machine list --json` and
 /// `machine status --json` so the two outputs never drift apart.
-fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
+fn machine_status_json(name: &str, record: &VmRecord, include_guest: bool) -> serde_json::Value {
     // Resolve via vsock probe so the JSON reflects truth (Unreachable vs
     // Running) instead of trusting the PID-only check.
     let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
+    let (memory, workload) = if include_guest && actual_state == RecordState::Running {
+        live_guest_diagnostics(name, record)
+    } else {
+        (None, None)
+    };
     // Expose the persisted health command as a single shell-friendly string
     // when it was stored as `["sh", "-c", "<cmd>"]`; otherwise a space-joined
     // argv so the field is always a string.
@@ -2876,11 +2881,109 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "health_timeout_secs": record.health_timeout_secs,
         "health_retries": record.health_retries,
         "health_startup_grace_secs": record.health_startup_grace_secs,
+        "memory": memory.as_ref().map(memory_status_json),
+        "workload": workload.as_ref().map(workload_status_json),
     });
     obj.as_object_mut()
         .unwrap()
         .insert("network".into(), serde_json::json!(record.network));
     obj
+}
+
+/// Ask the live guest for runtime diagnostics without turning status into a
+/// lifecycle operation. Failures (including an older agent rejecting an
+/// additive request) produce `null` fields in the JSON object.
+fn live_guest_diagnostics(
+    name: &str,
+    record: &VmRecord,
+) -> (Option<MemoryStatus>, Option<WorkloadStatus>) {
+    let Ok(manager) = AgentManager::for_vm(name) else {
+        return (None, None);
+    };
+    // This manager only locates the socket. Dropping an attached manager would
+    // shut down the VM, violating the read-only status contract.
+    manager.detach();
+    let Ok(mut client) =
+        smolvm::agent::AgentClient::connect_for_state_probe(manager.vsock_socket())
+    else {
+        return (None, None);
+    };
+
+    let memory = client.memory_status().ok();
+    let workload = record.image.as_ref().and_then(|_| {
+        let overlay_owner = smolvm::workload::persistent_overlay_owner_with_lineage(
+            name,
+            record.golden.as_deref(),
+            record.fork_overlay_owner.as_deref(),
+        );
+        client.workload_status(&overlay_owner).ok()
+    });
+    (memory, workload)
+}
+
+fn memory_status_json(status: &MemoryStatus) -> serde_json::Value {
+    serde_json::json!({
+        "total_bytes": status.total_bytes,
+        "available_bytes": status.available_bytes,
+        "used_bytes": status.used_bytes(),
+        "free_bytes": status.free_bytes,
+        "buffers_bytes": status.buffers_bytes,
+        "cached_bytes": status.cached_bytes,
+        "swap_total_bytes": status.swap_total_bytes,
+        "swap_used_bytes": status.swap_used_bytes,
+        "oom_kill_count": status.oom_kill_count,
+    })
+}
+
+fn workload_status_json(status: &WorkloadStatus) -> serde_json::Value {
+    serde_json::json!({
+        "state": status.state,
+        "last_exit_code": status.last_exit_code,
+        "last_exit_reason": status.last_exit_reason,
+        "oom_killed": status.oom_killed,
+    })
+}
+
+#[cfg(test)]
+mod machine_status_diagnostics_tests {
+    use super::{memory_status_json, workload_status_json};
+    use smolvm_protocol::{MemoryStatus, WorkloadState, WorkloadStatus};
+
+    #[test]
+    fn memory_json_uses_stable_snake_case_contract() {
+        let value = memory_status_json(&MemoryStatus {
+            total_bytes: 4096,
+            available_bytes: 1024,
+            free_bytes: 512,
+            cached_bytes: 256,
+            buffers_bytes: 128,
+            swap_total_bytes: 64,
+            swap_used_bytes: 32,
+            oom_kill_count: Some(3),
+        });
+        assert_eq!(value["total_bytes"], 4096);
+        assert_eq!(value["available_bytes"], 1024);
+        assert_eq!(value["used_bytes"], 3072);
+        assert_eq!(value["free_bytes"], 512);
+        assert_eq!(value["buffers_bytes"], 128);
+        assert_eq!(value["cached_bytes"], 256);
+        assert_eq!(value["oom_kill_count"], 3);
+        assert!(value.get("oomKillCount").is_none());
+    }
+
+    #[test]
+    fn workload_json_does_not_invent_exit_or_oom_attribution() {
+        let value = workload_status_json(&WorkloadStatus {
+            state: WorkloadState::Exited,
+            last_exit_code: None,
+            last_exit_reason: None,
+            oom_killed: None,
+        });
+        assert_eq!(value["state"], "exited");
+        assert!(value["last_exit_code"].is_null());
+        assert!(value["last_exit_reason"].is_null());
+        assert!(value["oom_killed"].is_null());
+    }
 }
 
 /// Emit a single machine's status as JSON — the same object shape as
@@ -2891,7 +2994,7 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
     // Build the owned JSON value inside the match so the borrow of `config`
     // ends before `config` is dropped.
     let obj = match config.list_vms().find(|(n, _)| *n == &label) {
-        Some((_, record)) => machine_status_json(&label, record),
+        Some((_, record)) => machine_status_json(&label, record, true),
         None => {
             return Err(smolvm::Error::config(
                 "machine status",
@@ -2936,7 +3039,7 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
     if json {
         let json_vms: Vec<_> = vms
             .iter()
-            .map(|(name, record)| machine_status_json(name, record))
+            .map(|(name, record)| machine_status_json(name, record, false))
             .collect();
         let json = serde_json::to_string_pretty(&json_vms)
             .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;

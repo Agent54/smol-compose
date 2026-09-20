@@ -205,6 +205,11 @@ test_status_json_output() {
         $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     }
+    [[ "$output" == *"\"memory\": null"* && "$output" == *"\"workload\": null"* ]] || {
+        echo "status --json must keep optional diagnostics keys stable: $output"
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
+        return 1
+    }
     $SMOLVM machine delete --name "$name" -f 2>/dev/null
 
     # `--json` on a machine that does not exist must error.

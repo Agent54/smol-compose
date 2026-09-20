@@ -2417,6 +2417,9 @@ fn handle_request(
 
         AgentRequest::StorageStatus => handle_storage_status(),
         AgentRequest::MemoryStatus => handle_memory_status(),
+        AgentRequest::WorkloadStatus {
+            persistent_overlay_id,
+        } => handle_workload_status(&persistent_overlay_id),
 
         AgentRequest::BranchpointWait { timeout_ms } => {
             let markers = branchpoint::Markers::standard();
@@ -6835,12 +6838,29 @@ fn handle_storage_status() -> AgentResponse {
 /// failing the request: `SwapTotal` is absent on a guest with no swap, and
 /// `MemAvailable` predates some very old kernels.
 fn handle_memory_status() -> AgentResponse {
-    AgentResponse::from_result(read_meminfo("/proc/meminfo"), error_codes::STATUS_FAILED)
+    AgentResponse::from_result(
+        read_memory_status("/proc/meminfo", "/proc/vmstat"),
+        error_codes::STATUS_FAILED,
+    )
+}
+
+/// Read the guest's allocator state plus its structured, kernel-maintained OOM
+/// counter. Memory remains available when an old kernel lacks `oom_kill`; the
+/// optional counter then stays `None` so callers do not confuse unsupported
+/// telemetry with "no OOM has happened".
+fn read_memory_status(
+    meminfo_path: &str,
+    vmstat_path: &str,
+) -> std::io::Result<smolvm_protocol::MemoryStatus> {
+    let mut status = parse_meminfo(&std::fs::read_to_string(meminfo_path)?);
+    status.oom_kill_count = std::fs::read_to_string(vmstat_path)
+        .ok()
+        .and_then(|text| parse_vmstat_oom_kill(&text));
+    Ok(status)
 }
 
 /// Parse the `Key:  value kB` lines of a meminfo file into bytes.
-fn read_meminfo(path: &str) -> std::io::Result<smolvm_protocol::MemoryStatus> {
-    let text = std::fs::read_to_string(path)?;
+fn parse_meminfo(text: &str) -> smolvm_protocol::MemoryStatus {
     let mut status = smolvm_protocol::MemoryStatus::default();
     let mut swap_free = 0u64;
 
@@ -6863,6 +6883,7 @@ fn read_meminfo(path: &str) -> std::io::Result<smolvm_protocol::MemoryStatus> {
             "MemAvailable" => status.available_bytes = bytes,
             "MemFree" => status.free_bytes = bytes,
             "Cached" => status.cached_bytes = bytes,
+            "Buffers" => status.buffers_bytes = bytes,
             "SwapTotal" => status.swap_total_bytes = bytes,
             "SwapFree" => swap_free = bytes,
             _ => {}
@@ -6873,9 +6894,87 @@ fn read_meminfo(path: &str) -> std::io::Result<smolvm_protocol::MemoryStatus> {
     // A kernel too old for MemAvailable would otherwise report everything as
     // used; free plus reclaimable cache is the estimate it replaced.
     if status.available_bytes == 0 {
-        status.available_bytes = status.free_bytes.saturating_add(status.cached_bytes);
+        status.available_bytes = status
+            .free_bytes
+            .saturating_add(status.cached_bytes)
+            .saturating_add(status.buffers_bytes);
     }
-    Ok(status)
+    status
+}
+
+/// Parse Linux's machine-wide cumulative OOM-kill counter from `/proc/vmstat`.
+/// This is intentionally not inferred from logs: vmstat is a stable structured
+/// kernel interface and survives log rotation and rate limiting.
+fn parse_vmstat_oom_kill(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("oom_kill"), Some(value), None) => value.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+/// Report only lifecycle facts the detached OCI path can prove.
+///
+/// `crun create` + `start` deliberately detach from the workload and leave no
+/// wait handle, so after process death there is no trustworthy exit code or
+/// per-process OOM reason to return. In particular, the machine-wide vmstat
+/// counter cannot identify which process was killed. Those fields therefore
+/// stay `None`; consumers may correlate them for diagnosis but must not present
+/// that correlation as workload attribution.
+fn handle_workload_status(persistent_overlay_id: &str) -> AgentResponse {
+    match workload_status_at(
+        std::path::Path::new(paths::OVERLAYS_DIR),
+        persistent_overlay_id,
+        is_container_running,
+    ) {
+        Some(status) => AgentResponse::ok_with_data(status),
+        None => AgentResponse::error(
+            "invalid persistent overlay id",
+            error_codes::INVALID_REQUEST,
+        ),
+    }
+}
+
+fn workload_status_at(
+    overlays_dir: &std::path::Path,
+    persistent_overlay_id: &str,
+    is_running: impl FnOnce(&str) -> bool,
+) -> Option<smolvm_protocol::WorkloadStatus> {
+    use smolvm_protocol::{WorkloadState, WorkloadStatus};
+
+    valid_persistent_overlay_id(persistent_overlay_id).then_some(())?;
+    let id_path = overlays_dir
+        .join(format!("persistent-{persistent_overlay_id}"))
+        .join("main_container_id");
+    let container_id = std::fs::read_to_string(id_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let state = match container_id {
+        Some(ref id) if is_running(id) => WorkloadState::Running,
+        Some(_) => WorkloadState::Exited,
+        None => WorkloadState::Unknown,
+    };
+
+    Some(WorkloadStatus {
+        state,
+        last_exit_code: None,
+        last_exit_reason: None,
+        oom_killed: None,
+    })
+}
+
+/// Persistent overlay IDs originate as validated VM names. Re-validate at the
+/// guest protocol boundary before using one to construct a storage path.
+fn valid_persistent_overlay_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && value.len() <= 128
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 // ============================================================================
@@ -8373,7 +8472,11 @@ fn branchpoint_error(e: branchpoint::TypedError) -> AgentResponse {
 
 #[cfg(test)]
 mod meminfo_tests {
-    use super::read_meminfo;
+    use super::{
+        parse_meminfo, parse_vmstat_oom_kill, read_memory_status, valid_persistent_overlay_id,
+        workload_status_at,
+    };
+    use smolvm_protocol::WorkloadState;
 
     fn write(contents: &str) -> tempfile::NamedTempFile {
         use std::io::Write as _;
@@ -8393,7 +8496,7 @@ mod meminfo_tests {
              MemAvailable:    3982212 kB\n\
              Cached:             9512 kB\n",
         );
-        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        let m = parse_meminfo(&std::fs::read_to_string(f.path()).unwrap());
 
         assert_eq!(m.total_bytes, 4_035_968 * 1024);
         assert_eq!(m.free_bytes, 4_001_728 * 1024);
@@ -8413,12 +8516,12 @@ mod meminfo_tests {
              SwapTotal:       2048 kB\n\
              SwapFree:         512 kB\n",
         );
-        let m = read_meminfo(with_swap.path().to_str().unwrap()).expect("parses");
+        let m = parse_meminfo(&std::fs::read_to_string(with_swap.path()).unwrap());
         assert_eq!(m.swap_total_bytes, 2048 * 1024);
         assert_eq!(m.swap_used_bytes, (2048 - 512) * 1024);
 
         let no_swap = write("MemTotal:        1024 kB\nMemAvailable:     512 kB\n");
-        let m = read_meminfo(no_swap.path().to_str().unwrap()).expect("parses");
+        let m = parse_meminfo(&std::fs::read_to_string(no_swap.path()).unwrap());
         assert_eq!(m.swap_total_bytes, 0);
         assert_eq!(m.swap_used_bytes, 0);
     }
@@ -8430,11 +8533,12 @@ mod meminfo_tests {
         let f = write(
             "MemTotal:        1000 kB\n\
              MemFree:          200 kB\n\
-             Cached:           300 kB\n",
+             Cached:           300 kB\n\
+             Buffers:           25 kB\n",
         );
-        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
-        assert_eq!(m.available_bytes, 500 * 1024);
-        assert_eq!(m.used_bytes(), 500 * 1024);
+        let m = parse_meminfo(&std::fs::read_to_string(f.path()).unwrap());
+        assert_eq!(m.available_bytes, 525 * 1024);
+        assert_eq!(m.used_bytes(), 475 * 1024);
     }
 
     /// Lines this build does not care about, and malformed ones, must not
@@ -8449,8 +8553,63 @@ mod meminfo_tests {
              Bogus:          notanumber kB\n\
              MemAvailable:     1024 kB\n",
         );
-        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        let m = parse_meminfo(&std::fs::read_to_string(f.path()).unwrap());
         assert_eq!(m.total_bytes, 2048 * 1024);
         assert_eq!(m.available_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn vmstat_oom_kill_is_parsed_as_a_cumulative_counter() {
+        assert_eq!(
+            parse_vmstat_oom_kill("pgfault 123\noom_kill 7\npgmajfault 2\n"),
+            Some(7)
+        );
+        assert_eq!(parse_vmstat_oom_kill("pgfault 123\n"), None);
+        assert_eq!(parse_vmstat_oom_kill("oom_kill nope\n"), None);
+    }
+
+    #[test]
+    fn memory_status_keeps_memory_when_vmstat_is_unavailable() {
+        let meminfo = write("MemTotal: 2048 kB\nMemAvailable: 1024 kB\n");
+        let missing_vmstat = meminfo.path().with_extension("missing-vmstat");
+        let m = read_memory_status(
+            meminfo.path().to_str().unwrap(),
+            missing_vmstat.to_str().unwrap(),
+        )
+        .expect("meminfo still succeeds");
+        assert_eq!(m.total_bytes, 2048 * 1024);
+        assert_eq!(m.oom_kill_count, None);
+    }
+
+    #[test]
+    fn persistent_overlay_ids_are_revalidated_at_the_protocol_boundary() {
+        assert!(valid_persistent_overlay_id("xe-launcher"));
+        assert!(valid_persistent_overlay_id("machine_42"));
+        assert!(!valid_persistent_overlay_id("../storage"));
+        assert!(!valid_persistent_overlay_id("machine/name"));
+        assert!(!valid_persistent_overlay_id("-machine"));
+        assert!(!valid_persistent_overlay_id("machine--name"));
+    }
+
+    #[test]
+    fn detached_workload_status_reports_only_provable_state() {
+        let overlays = tempfile::tempdir().unwrap();
+
+        let unknown = workload_status_at(overlays.path(), "machine", |_| false).unwrap();
+        assert_eq!(unknown.state, WorkloadState::Unknown);
+
+        let workload_dir = overlays.path().join("persistent-machine");
+        std::fs::create_dir(&workload_dir).unwrap();
+        std::fs::write(workload_dir.join("main_container_id"), "container-1\n").unwrap();
+
+        let running =
+            workload_status_at(overlays.path(), "machine", |id| id == "container-1").unwrap();
+        assert_eq!(running.state, WorkloadState::Running);
+
+        let exited = workload_status_at(overlays.path(), "machine", |_| false).unwrap();
+        assert_eq!(exited.state, WorkloadState::Exited);
+        assert_eq!(exited.last_exit_code, None);
+        assert_eq!(exited.last_exit_reason, None);
+        assert_eq!(exited.oom_killed, None);
     }
 }
