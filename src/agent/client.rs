@@ -10,7 +10,7 @@ use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, MemoryStatus,
-    OverlayInfo, StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
+    OverlayInfo, StorageStatus, WorkloadStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
     FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
@@ -1706,6 +1706,17 @@ impl AgentClient {
     pub fn memory_status(&mut self) -> Result<MemoryStatus> {
         let resp = self.request(&AgentRequest::MemoryStatus)?;
         expect_data(resp, "memory status")
+    }
+
+    /// The persistent image workload's observable lifecycle state.
+    ///
+    /// Older agents reject this additive request; callers should treat that as
+    /// unavailable diagnostics, not as a machine failure.
+    pub fn workload_status(&mut self, persistent_overlay_id: &str) -> Result<WorkloadStatus> {
+        let resp = self.request(&AgentRequest::WorkloadStatus {
+            persistent_overlay_id: persistent_overlay_id.to_string(),
+        })?;
+        expect_data(resp, "workload status")
     }
 
     /// Test network connectivity directly from the agent (not via chroot).

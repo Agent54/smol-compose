@@ -388,7 +388,8 @@ pub enum AgentRequest {
     StorageStatus,
 
     /// Report the guest's own view of machine memory, read from
-    /// `/proc/meminfo`.
+    /// `/proc/meminfo`, plus its cumulative OOM-kill counter from
+    /// `/proc/vmstat`.
     ///
     /// The host cannot answer this. macOS charges the VMM's `phys_footprint`
     /// as `internal + compressed`, and the compressed part is counted at the
@@ -396,6 +397,17 @@ pub enum AgentRequest {
     /// compressed reports a footprint several times the bytes it actually
     /// occupies. Only the guest's allocator knows what the machine is using.
     MemoryStatus,
+
+    /// Report the persistent image workload's observable lifecycle state.
+    ///
+    /// Detached OCI workloads do not leave a wait handle with the agent, so
+    /// an exited workload can be identified but its exact exit status cannot
+    /// generally be recovered. The response leaves exit attribution unset
+    /// rather than guessing from a machine-wide OOM counter.
+    WorkloadStatus {
+        /// Owner of the persistent overlay associated with the workload.
+        persistent_overlay_id: String,
+    },
 
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
@@ -815,6 +827,7 @@ impl AgentRequest {
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
+            AgentRequest::WorkloadStatus { .. } => "WorkloadStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
@@ -1197,10 +1210,19 @@ pub struct MemoryStatus {
     pub free_bytes: u64,
     /// Page cache in bytes. Counted inside `available_bytes`.
     pub cached_bytes: u64,
+    /// Block-device buffers in bytes. Counted inside `available_bytes`.
+    #[serde(default)]
+    pub buffers_bytes: u64,
     /// Swap configured in the guest, in bytes. Zero when the guest has none.
     pub swap_total_bytes: u64,
     /// Swap in use, in bytes.
     pub swap_used_bytes: u64,
+    /// Machine-wide cumulative OOM kills since this kernel booted, from
+    /// `/proc/vmstat`'s `oom_kill` counter. `None` means the running guest
+    /// predates this field or its kernel does not publish the counter; it must
+    /// not be treated as zero by a recovery controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kill_count: Option<u64>,
 }
 
 impl MemoryStatus {
@@ -1208,6 +1230,40 @@ impl MemoryStatus {
     pub fn used_bytes(&self) -> u64 {
         self.total_bytes.saturating_sub(self.available_bytes)
     }
+}
+
+/// Observable state of the persistent image workload inside a machine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadState {
+    /// The OCI workload process is currently alive.
+    Running,
+    /// A persisted workload identity exists, but its process is no longer alive.
+    Exited,
+    /// No workload identity is available (never launched, cleaned up, or an
+    /// older guest that did not retain it).
+    Unknown,
+}
+
+/// Persistent workload diagnostics returned by [`AgentRequest::WorkloadStatus`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadStatus {
+    /// Lifecycle state that can be established from crun's persisted process
+    /// identity and `/proc` with PID-reuse protection.
+    pub state: WorkloadState,
+    /// Exact exit code when the lifecycle owns a wait handle. Detached OCI
+    /// workloads currently do not, so this remains `None` after they exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    /// Exact structured exit reason when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_reason: Option<String>,
+    /// Exact workload-specific OOM attribution when available. A machine-wide
+    /// `oom_kill` increment is deliberately insufficient evidence, so detached
+    /// OCI workloads report `None`, not a guessed boolean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_killed: Option<bool>,
 }
 
 /// Storage status information.
@@ -1651,6 +1707,40 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("progress"));
+    }
+
+    #[test]
+    fn legacy_memory_status_defaults_new_diagnostics() {
+        let legacy = r#"{
+            "totalBytes": 4096,
+            "availableBytes": 2048,
+            "freeBytes": 1024,
+            "cachedBytes": 512,
+            "swapTotalBytes": 0,
+            "swapUsedBytes": 0
+        }"#;
+        let status: MemoryStatus = serde_json::from_str(legacy).unwrap();
+        assert_eq!(status.buffers_bytes, 0);
+        assert_eq!(status.oom_kill_count, None);
+
+        let encoded = serde_json::to_value(status).unwrap();
+        assert_eq!(encoded["buffersBytes"], 0);
+        assert!(encoded.get("oomKillCount").is_none());
+    }
+
+    #[test]
+    fn workload_status_preserves_unknown_oom_attribution() {
+        let status = WorkloadStatus {
+            state: WorkloadState::Exited,
+            last_exit_code: None,
+            last_exit_reason: None,
+            oom_killed: None,
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["state"], "exited");
+        assert!(encoded.get("oomKilled").is_none());
+        let decoded: WorkloadStatus = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, status);
     }
 
     #[test]
