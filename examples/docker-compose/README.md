@@ -65,6 +65,49 @@ run inside the VM.
 For the underlying kernel, storage-driver, and Docker-socket rationale, see
 [`../docker-in-vm/docker.smolfile`](../docker-in-vm/docker.smolfile).
 
+### Self-hosted macOS runner setup
+
+The Compose integration and release jobs on `[self-hosted, macOS, ARM64, raw]`
+expect tools to be installed by the machine administrator. They check for
+dependencies and fail with setup instructions; they do not invoke Homebrew.
+The integration job checks Git LFS before checkout so a missing executable does
+not fail inside `actions/checkout`.
+
+The runner service uses the PATH saved in `actions-runner/.path` by
+[`env.sh`](https://github.com/actions/runner/blob/main/src/Misc/layoutroot/env.sh).
+[`runsvc.sh`](https://github.com/actions/runner/blob/main/src/Misc/layoutbin/runsvc.sh)
+loads that file when started by `./svc.sh start`. Adding a directory to
+`.zshrc` or installing a tool in an interactive shell does not update the
+service's saved PATH.
+
+Download the Mac Apple Silicon archive from [Git LFS](https://git-lfs.com/)
+and extract it. As the same user that runs the macOS runner service, install
+the extracted `git-lfs` binary in a dedicated directory and update the saved
+service PATH. Run this from the runner installation directory, not the
+repository checkout:
+
+```sh
+cd /path/to/actions-runner
+./svc.sh stop
+mkdir -p tools/bin
+install -m 0755 /path/to/extracted/git-lfs tools/bin/git-lfs
+printf '%s\n' "$PWD/tools/bin:$(cat .path)" > .path
+env PATH="$(cat .path)" /bin/bash --noprofile --norc -c 'git lfs version'
+./svc.sh start
+```
+
+This preserves existing PATH entries and exposes Git LFS without adding the
+Homebrew `bin` directory. Keep any Homebrew `bin` entries out of `.path` if the
+service must not be able to invoke `brew`. Do not run macOS `svc.sh` with sudo.
+
+Provision `docker`, `docker-compose` (or the Docker Compose plugin), `socat`,
+`curl`, and Python 3 the same way: their executable directories must be in
+`.path`, and the service must be restarted after changes. The integration job
+also needs e2fsprogs for `mkfs.ext4`; SmolVM searches the standard installation
+paths, or you can expose its `sbin` directory through `.path`. The release job
+uses the distribution's bundled disk templates. No host Docker daemon is
+needed.
+
 ## 1. Start the host Unix-socket fixture
 
 Create the example's ignored runtime directory:

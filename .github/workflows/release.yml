@@ -538,8 +538,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install host clients and image tools
-        run: brew install docker docker-compose e2fsprogs socat
+      - name: Check host clients and image tools
+        run: |
+          missing=()
+          for tool in docker socat curl python3; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+            missing+=("docker-compose or the Docker Compose plugin")
+          fi
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing runner service tools: ${missing[*]} (PATH=$PATH)."
+            echo "Install these tools manually and add their directories to actions-runner/.path, then restart with ./svc.sh stop and ./svc.sh start." >&2
+            echo "See examples/docker-compose/README.md#self-hosted-macos-runner-setup." >&2
+            exit 1
+          fi
 
       - uses: actions/download-artifact@v8
         with:

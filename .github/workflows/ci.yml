@@ -410,10 +410,10 @@ jobs:
 
   # ==========================================================================
   # Downstream compatibility: the smol CLI builds this workspace via path deps
-  # (`smolvm = { path = ".." }`) and releases in version lockstep, so an engine
-  # API change that breaks smol otherwise surfaces only at release time (as
-  # with the LaunchConfig `published_sockets` field). Compile smol's main
-  # against this PR so the break fails HERE, before merge.
+  # (`smolvm = { path = ".." }`). This fork stays on the 1.16.2 engine API;
+  # upstream smol main now requires newer APIs. Keep checking the revision
+  # used by the last passing Compose CI run (35511134961), and update this
+  # pin together with any intentional engine API upgrade.
   # ==========================================================================
   smol-compat:
     name: smol CLI compatibility
@@ -423,10 +423,11 @@ jobs:
         with:
           lfs: false
 
-      - name: Checkout smol (main) into the monorepo
+      - name: Checkout compatible smol into the monorepo
         uses: actions/checkout@v6
         with:
           repository: smol-machines/smol
+          ref: 65aecb2b2783db1d25202167b8feab92fe6027b9
           path: smol
 
       - uses: dtolnay/rust-toolchain@stable
