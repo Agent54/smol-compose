@@ -1251,10 +1251,7 @@ impl AgentManager {
     /// it. Read at failure time: the file lives only as long as the VM
     /// directory, which an ephemeral run removes on the way out.
     fn read_console_log(&self) -> Option<String> {
-        std::fs::read_to_string(self.console_log.as_deref()?)
-            .ok()
-            .map(|content| content.trim().to_string())
-            .filter(|content| !content.is_empty())
+        read_console_tail(self.console_log.as_deref()?)
     }
 
     /// Get the storage disk path.
@@ -3463,6 +3460,13 @@ fn last_significant_line(log: &str) -> Option<String> {
         })
 }
 
+/// Failure diagnostics must survive binary output and never load a whole log.
+fn read_console_tail(path: &Path) -> Option<String> {
+    let (bytes, _) = crate::log_rotation::read_tail(path, 64 * 1024).ok()?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Longest console line carried into the failure message; a guest can print
 /// arbitrarily long lines and this message goes in a one-line error.
 const CONSOLE_LINE_MAX: usize = 200;
@@ -3982,6 +3986,19 @@ mod tests {
     // "Couldn't execute '/sbin/init': ENOENT" to that file while the user saw
     // only "boot process exited (code 127)" and a list of guesses, and the file
     // vanished with the VM directory on an ephemeral run.
+    #[test]
+    fn boot_failure_reader_handles_binary_and_unterminated_console_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-console.log");
+        let mut bytes = vec![b'x'; 2 * 1024 * 1024];
+        bytes.extend_from_slice(b"\xff\x00\nerror initializing buildkit: invalid suffix: %\n");
+        std::fs::write(&path, bytes).unwrap();
+        let console = super::read_console_tail(&path).unwrap();
+        assert!(console.len() <= 3 * 64 * 1024);
+        let reason = boot_failure_reason(Some(1), None, Some(&console));
+        assert!(reason.contains("invalid suffix: %"), "{reason}");
+    }
+
     #[test]
     fn boot_failure_surfaces_the_guest_console_when_the_startup_log_is_empty() {
         let console = "smolvm-agent starting\nCouldn't execute '/sbin/init': ENOENT\n";

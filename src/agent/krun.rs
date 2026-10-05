@@ -334,6 +334,7 @@ impl KrunFunctions {
     /// `krun_set_console_output`). Returns libkrun's rc, or a negative value if
     /// the file can't be opened.
     ///
+    /// A reader in this VM process drains the output pipe into bounded log files.
     /// The opened fds are intentionally leaked: a console device's fds must stay
     /// valid for the VM's lifetime, and `krun_start_enter` runs the VM in this
     /// process, so the process owns them until it exits.
@@ -342,19 +343,28 @@ impl KrunFunctions {
     /// `ctx` must be a valid libkrun context that has not yet been started.
     #[cfg(unix)]
     pub unsafe fn console_output_to_file(&self, ctx: u32, path: &Path) -> i32 {
-        use std::os::fd::IntoRawFd;
-        let Ok(out) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        else {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let Ok(out) = crate::log_rotation::console_output(path) else {
             return -1;
         };
-        let out_fd = out.into_raw_fd();
+        let Ok(null) = std::fs::File::open("/dev/null") else {
+            return -1;
+        };
         // Console input comes from /dev/null (the agent talks over vsock, not the
-        // console); output and stderr both go to the log file.
-        let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-        unsafe { (self.add_virtio_console_default)(ctx, null_fd, out_fd, out_fd) }
+        // console); output and stderr both go through the bounded log writer.
+        let result = unsafe {
+            (self.add_virtio_console_default)(
+                ctx,
+                null.as_raw_fd(),
+                out.as_raw_fd(),
+                out.as_raw_fd(),
+            )
+        };
+        if result >= 0 {
+            let _ = null.into_raw_fd();
+            let _ = out.into_raw_fd();
+        }
+        result
     }
 
     /// Redirect the guest console output to `path` on Windows, where libkrun
@@ -364,6 +374,7 @@ impl KrunFunctions {
     /// fails to boot leaves no record of why -- the log the other platforms
     /// write is simply absent.
     ///
+    /// A reader in this VM process drains the output pipe into bounded log files.
     /// The opened handles are intentionally leaked, for the same reason as on
     /// Unix: the console device holds them for the VM's lifetime, and
     /// `krun_start_enter` runs the VM in this process.
@@ -372,13 +383,9 @@ impl KrunFunctions {
     /// `ctx` must be a valid libkrun context that has not yet been started.
     #[cfg(windows)]
     pub unsafe fn console_output_to_file(&self, ctx: u32, path: &Path) -> i32 {
-        use std::os::windows::io::IntoRawHandle;
+        use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 
-        let Ok(out) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        else {
+        let Ok(out) = crate::log_rotation::console_output(path) else {
             return -1;
         };
         // Console input comes from the null device (the agent talks over vsock,
@@ -387,9 +394,19 @@ impl KrunFunctions {
             return -1;
         };
 
-        let out_handle = out.into_raw_handle();
-        let null_handle = null.into_raw_handle();
-        unsafe { (self.add_virtio_console_default)(ctx, null_handle, out_handle, out_handle) }
+        let result = unsafe {
+            (self.add_virtio_console_default)(
+                ctx,
+                null.as_raw_handle(),
+                out.as_raw_handle(),
+                out.as_raw_handle(),
+            )
+        };
+        if result >= 0 {
+            let _ = null.into_raw_handle();
+            let _ = out.into_raw_handle();
+        }
+        result
     }
 }
 

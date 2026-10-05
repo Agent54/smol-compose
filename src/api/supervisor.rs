@@ -34,8 +34,8 @@ pub struct Supervisor {
     /// Per-machine instant at which a scheduled restart becomes due. Lets the
     /// supervisor honor restart backoff WITHOUT sleeping inside the shared
     /// health-check loop: a crash-looping machine with a long exponential
-    /// backoff must not stall every other machine's liveness check, gauge
-    /// reconcile, and log rotation. The supervisor is the single task that owns
+    /// backoff must not stall every other machine's liveness check or gauge
+    /// reconcile. The supervisor is the single task that owns
     /// the loop, so a plain map needs no synchronization. Entries are cleared
     /// when a machine is alive again, its restart fires, or its policy stops it.
     next_restart_at: std::collections::HashMap<String, tokio::time::Instant>,
@@ -106,9 +106,6 @@ impl Supervisor {
         let (total, running) = self.state.machine_counts();
         metrics::gauge!("smolvm_machines_running").set(running as f64);
         metrics::gauge!("smolvm_machines_total").set(total as f64);
-
-        // Also rotate logs for all machines
-        self.rotate_logs_if_needed().await;
     }
 
     /// Check a single machine and restart if needed.
@@ -359,38 +356,6 @@ impl Supervisor {
                 tracing::error!(machine = %name, error = %e, "failed to restart machine");
                 Err(e)
             }
-        }
-    }
-
-    /// Rotate logs for all machines if they exceed the size limit.
-    async fn rotate_logs_if_needed(&self) {
-        let machine_names = self.state.list_machine_names();
-
-        for name in machine_names {
-            if let Some(log_path) = self.get_machine_log_path(&name) {
-                if let Err(e) = crate::log_rotation::rotate_if_needed(&log_path) {
-                    tracing::debug!(machine = %name, error = %e, "failed to rotate logs");
-                }
-            }
-        }
-    }
-
-    /// Get the console log path for a machine.
-    ///
-    /// Resolves to the VM's hash-derived data directory — the canonical
-    /// layout used by `AgentManager::new_internal` and exposed via
-    /// `vm_data_dir` / the `machine data-dir` CLI command.
-    fn get_machine_log_path(&self, name: &str) -> Option<std::path::PathBuf> {
-        if crate::data::validate_vm_name(name, "machine name").is_err() {
-            tracing::warn!(machine = %name, "skipping invalid machine name when resolving log path");
-            return None;
-        }
-
-        let log_path = crate::agent::vm_data_dir(name).join("agent-console.log");
-        if log_path.exists() {
-            Some(log_path)
-        } else {
-            None
         }
     }
 }
