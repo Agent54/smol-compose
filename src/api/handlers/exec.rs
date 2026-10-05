@@ -10,7 +10,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::convert::Infallible;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -806,37 +806,26 @@ pub async fn stream_logs(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// Read the last N lines from a file using a bounded ring buffer.
+/// Read a bounded byte tail, tolerating binary data and arbitrarily long lines.
 /// Returns (lines, file_position_at_end) for follow mode.
 fn read_last_n_lines_bounded(
     path: &std::path::Path,
     n: usize,
 ) -> std::io::Result<(Vec<String>, u64)> {
-    use std::collections::VecDeque;
-
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    let file_len = metadata.len();
-
-    // n == 0 means "no tail lines" — skip reading the file entirely
+    // n == 0 means "no tail lines" — skip reading the file entirely.
     if n == 0 {
-        return Ok((Vec::new(), file_len));
+        return Ok((Vec::new(), std::fs::metadata(path)?.len()));
     }
-
-    let reader = BufReader::new(file);
-
-    // Use a ring buffer to keep only the last N lines in memory
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(n + 1);
-
-    for line in reader.lines() {
-        let line = line?;
-        if ring.len() == n {
-            ring.pop_front();
-        }
-        ring.push_back(line);
-    }
-
-    Ok((ring.into_iter().collect(), file_len))
+    let (bytes, position) =
+        crate::log_rotation::read_tail(path, crate::log_rotation::MAX_LOG_SIZE)?;
+    let mut lines: Vec<String> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .rev()
+        .take(n)
+        .map(str::to_string)
+        .collect();
+    lines.reverse();
+    Ok((lines, position))
 }
 
 /// Maximum bytes to read per poll cycle (64 KiB).
@@ -871,4 +860,51 @@ fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(Stri
 
     let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((text, new_pos))
+}
+
+#[cfg(test)]
+mod console_reader_tests {
+    use super::*;
+
+    #[test]
+    fn tail_handles_invalid_utf8_and_bounds_an_unterminated_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let mut bytes = vec![b'x'; crate::log_rotation::MAX_LOG_SIZE as usize * 3];
+        bytes.extend_from_slice(b"\xff\nerror: Docker startup failed\n");
+        let file_length = bytes.len() as u64;
+        std::fs::write(&path, bytes).unwrap();
+        let (lines, position) = read_last_n_lines_bounded(&path, 10_000).unwrap();
+        assert_eq!(position, file_length);
+        assert_eq!(lines.last().unwrap(), "error: Docker startup failed");
+        assert!(lines.first().unwrap().contains('\u{fffd}'));
+        assert!(
+            lines.iter().map(String::len).sum::<usize>()
+                <= crate::log_rotation::MAX_LOG_SIZE as usize * 3
+        );
+    }
+
+    #[test]
+    fn tail_keeps_the_requested_line_count_for_text_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let lines: Vec<String> = (0..10_000)
+            .map(|i| format!("{i}: {}\n", "x".repeat(128)))
+            .collect();
+        std::fs::write(&path, lines.concat()).unwrap();
+        let (tail, _) = read_last_n_lines_bounded(&path, 10_000).unwrap();
+        assert_eq!(tail.len(), 10_000);
+        assert_eq!(tail[0], lines[0].trim_end());
+        assert_eq!(tail[9_999], lines[9_999].trim_end());
+    }
+
+    #[test]
+    fn zero_tail_does_not_read_previous_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        std::fs::write(&path, b"previous output\n").unwrap();
+        let (lines, position) = read_last_n_lines_bounded(&path, 0).unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(position, 16);
+    }
 }

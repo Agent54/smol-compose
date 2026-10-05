@@ -9,7 +9,7 @@ use std::io;
 use std::path::Path;
 
 /// Maximum log file size before rotation (10 MB).
-const MAX_LOG_SIZE: u64 = 10 * BYTES_PER_MIB;
+pub(crate) const MAX_LOG_SIZE: u64 = 10 * BYTES_PER_MIB;
 
 /// Maximum number of rotated log files to keep.
 const MAX_LOG_FILES: usize = 3;
@@ -43,15 +43,11 @@ pub fn rotate_if_needed(log_path: &Path) -> io::Result<bool> {
 /// Rotates the log file following the same pattern as `rotate_if_needed`.
 ///
 /// The active (live) log is rotated with **copy-truncate** semantics rather
-/// than a rename. The live console log is written by libkrun through an
-/// intentionally-leaked append fd bound to the file's inode for the VM's whole
-/// lifetime (see `KrunFunctions::console_output_to_file`). A `rename` would
-/// leave that leaked fd pointing at the renamed inode (`.1`), so libkrun would
-/// keep appending to `.1` — which then rotates onward and gets deleted, losing
-/// all live output, while `tail agent-console.log` sees a frozen file.
+/// than a rename. The console capture owns an append fd for the VM's lifetime.
+/// Keeping the live inode also lets existing readers stay attached to the log.
 ///
 /// Instead we copy the live file's contents to `.1` and then truncate the
-/// original in place. Because the leaked fd is `O_APPEND`, its next write lands
+/// original in place. Because the capture fd is `O_APPEND`, its next write lands
 /// at offset 0 of the now-empty inode, so the writer stays valid and continues
 /// into the same file. Already-rotated `.1`/`.2`/`.3` files are nobody's live
 /// fd, so they are still shifted with plain renames.
@@ -139,11 +135,173 @@ pub fn cleanup_logs(log_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Reads a bounded byte tail without assuming UTF-8 or newline-delimited output.
+pub(crate) fn read_tail(path: &Path, limit: u64) -> io::Result<(Vec<u8>, u64)> {
+    use io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let end = file.metadata()?.len();
+    let start = end.saturating_sub(limit);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(end - start).read_to_end(&mut bytes)?;
+    let position = start + bytes.len() as u64;
+    Ok((bytes, position))
+}
+
+/// Owns the live console writer and rotates before a write exceeds the limit.
+struct ConsoleWriter {
+    path: std::path::PathBuf,
+    file: fs::File,
+    size: u64,
+    limit: u64,
+}
+
+impl ConsoleWriter {
+    fn new(path: &Path, limit: u64) -> io::Result<Self> {
+        use io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        let mut size = file.metadata()?.len();
+        // Preserve a bounded tail of logs produced before capture had a limit.
+        if size > limit {
+            let (tail, _) = read_tail(path, limit)?;
+            file.set_len(0)?;
+            file.write_all(&tail)?;
+            size = tail.len() as u64;
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            size,
+            limit,
+        })
+    }
+
+    fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
+        use io::Write;
+        while !data.is_empty() {
+            if self.size == self.limit {
+                rotate(&self.path)?;
+                self.size = 0;
+            }
+            let count = data.len().min((self.limit - self.size) as usize);
+            self.file.write_all(&data[..count])?;
+            self.size += count as u64;
+            data = &data[count..];
+        }
+        Ok(())
+    }
+}
+
+/// Capture belongs to the VM process, so CLI starts have the same limits as API starts.
+pub(crate) fn console_output(path: &Path) -> io::Result<io::PipeWriter> {
+    let writer = ConsoleWriter::new(path, MAX_LOG_SIZE)?;
+    let (reader, output) = io::pipe()?;
+    spawn_console_reader(reader, writer)?;
+    Ok(output)
+}
+
+fn spawn_console_reader(
+    mut reader: io::PipeReader,
+    mut writer: ConsoleWriter,
+) -> io::Result<std::thread::JoinHandle<io::Result<()>>> {
+    std::thread::Builder::new()
+        .name("smolvm-console".into())
+        .spawn(move || {
+            use io::Read;
+            let result: io::Result<()> = (|| {
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let count = match reader.read(&mut buffer) {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        result => result?,
+                    };
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    writer.write_all(&buffer[..count])?;
+                }
+            })();
+            if let Err(error) = &result {
+                tracing::warn!(%error, "console log capture failed");
+                // A full disk must not block or SIGPIPE the workload.
+                let _ = io::copy(&mut reader, &mut io::sink());
+            }
+            result
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn cli_console_capture_rotates_without_an_api_supervisor() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agent-console.log");
+        const LIMIT: u64 = 4096;
+        let writer = ConsoleWriter::new(&path, LIMIT).unwrap();
+        let (reader, mut output) = io::pipe().unwrap();
+        let capture = spawn_console_reader(reader, writer).unwrap();
+        // Exceed the pipe's capacity, with binary bytes and no newlines.
+        let bytes: Vec<u8> = (0..512 * 1024 + 17)
+            .map(|i| {
+                let byte = ((i + (i / LIMIT as usize) * 17) % 256) as u8;
+                if byte == b'\n' {
+                    0xff
+                } else {
+                    byte
+                }
+            })
+            .collect();
+        output.write_all(&bytes).unwrap();
+        drop(output);
+        capture.join().unwrap().unwrap();
+        let mut retained = Vec::new();
+        for suffix in [".3", ".2", ".1", ""] {
+            let file = dir.path().join(format!("agent-console.log{suffix}"));
+            assert!(fs::metadata(&file).unwrap().len() <= LIMIT);
+            retained.extend(fs::read(file).unwrap());
+        }
+        assert!(retained.len() <= 4 * LIMIT as usize);
+        assert_eq!(retained, bytes[bytes.len() - retained.len()..]);
+    }
+
+    #[test]
+    fn an_oversized_legacy_console_is_bounded_before_archiving() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("console.log");
+        fs::write(&path, b"old output that exceeded the old limit").unwrap();
+        let mut writer = ConsoleWriter::new(&path, 16).unwrap();
+        writer.write_all(b"new error").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 9);
+        assert_eq!(
+            fs::metadata(path.with_extension("log.1")).unwrap().len(),
+            16
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"new error");
+    }
+
+    #[test]
+    fn byte_tail_preserves_binary_output_and_bounds_unterminated_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("console.log");
+        let mut data = vec![b'x'; 128 * 1024];
+        data.extend_from_slice(b"\xff\x00error: Docker startup failed");
+        fs::write(&path, &data).unwrap();
+        let (tail, position) = read_tail(&path, 1024).unwrap();
+        assert_eq!(position, data.len() as u64);
+        assert_eq!(tail, data[data.len() - 1024..]);
+        assert!(String::from_utf8_lossy(&tail).contains("Docker startup failed"));
+    }
 
     fn create_test_log(dir: &TempDir, content_size: usize) -> std::path::PathBuf {
         let log_path = dir.path().join("test.log");

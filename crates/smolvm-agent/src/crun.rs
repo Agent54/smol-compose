@@ -234,10 +234,10 @@ impl CrunCommand {
     /// Create a container: `crun create --bundle <path> <id>`
     ///
     /// This puts the container in "created" state, ready for `crun start`.
-    /// Stdio is null because the created container inherits it: capturing the
-    /// pipes would make `output()` block until the container itself exits.
-    /// crun's own diagnostics therefore go to [`create_log_path`], which a
-    /// failed create reads back with [`take_create_log`].
+    /// The workload inherits the agent console, which the host retains and
+    /// rotates. Capturing pipes here would make `output()` wait until the
+    /// workload exits, while null stdio silently discards startup failures.
+    /// crun's own diagnostics still use [`create_log_path`] on create failure.
     pub fn create(bundle_dir: &Path, container_id: &str) -> Self {
         let log_path = create_log_path(container_id);
         // A stale log from an earlier attempt would be misreported as this
@@ -258,8 +258,8 @@ impl CrunCommand {
             container_id,
         ]);
         c.cmd.stdin(Stdio::null());
-        c.cmd.stdout(Stdio::null());
-        c.cmd.stderr(Stdio::null());
+        c.cmd.stdout(Stdio::inherit());
+        c.cmd.stderr(Stdio::inherit());
         c
     }
 

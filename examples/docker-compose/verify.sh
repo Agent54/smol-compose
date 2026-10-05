@@ -29,6 +29,7 @@ EMBEDDED_VM_SOCKET=""
 PACK_OUTPUT="$STATE_DIR/verify-pack-$SOCKET_ID.bin"
 PACK_STAGING="$STATE_DIR/verify-pack-$SOCKET_ID.staging"
 EMBEDDED_START_LOG="$STATE_DIR/verify-embedded-start-$SOCKET_ID.log"
+DAEMON_CONFIG_DIR="$STATE_DIR/verify-daemon-config-$SOCKET_ID.dir"
 KEEP_STATE="${KEEP_STATE:-0}"
 EXPORT_PACK="${EXPORT_PACK:-0}"
 
@@ -119,6 +120,7 @@ cleanup() {
         rm -f -- "$STATE_DIR/verify-pack-${SOCKET_ID}.bin.smolmachine"
         rm -f -- "$STATE_DIR/verify-embedded-start-${SOCKET_ID}.log"
         rm -rf -- "$STATE_DIR/verify-pack-${SOCKET_ID}.staging"
+        rm -rf -- "$DAEMON_CONFIG_DIR"
     fi
 
     if [[ "$SHORT_STATE_LINK_CREATED" == 1 ]]; then
@@ -289,10 +291,16 @@ for _attempt in $(seq 1 20); do
 done
 [[ -S "$HOST_SOCKET" ]] || fail "host socket fixture did not start: $HOST_SOCKET"
 
+mkdir -p "$DAEMON_CONFIG_DIR"
+cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
+{"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
+JSON
+
 printf '1/5 Creating normal Compose machine %s\n' "$NORMAL_MACHINE"
 "$SMOLVM_BIN" machine create \
     --name "$NORMAL_MACHINE" \
     --smolfile "$SMOLFILE" \
+    --volume "$DAEMON_CONFIG_DIR:/etc/docker:ro" \
     --net-backend virtio-net \
     --port "$NORMAL_PORT:8080" \
     --expose-socket "/var/run/docker.sock:$DOCKER_SOCKET" \
@@ -306,6 +314,8 @@ wait_for_guest_docker "$NORMAL_MACHINE"
 wait_for_host_docker "$DOCKER_SOCKET"
 compose_for "$DOCKER_SOCKET" up -d --wait
 NORMAL_COMPOSE=1
+NORMAL_DATA_DIR="$("$SMOLVM_BIN" machine data-dir --name "$NORMAL_MACHINE")"
+grep -Fq 'Starting up' "$NORMAL_DATA_DIR/agent-console.log" || fail "Docker startup output was discarded"
 verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT"
 
 printf '2/5 Restarting normal machine and rechecking persistence\n'
@@ -317,6 +327,35 @@ wait_for_guest_docker "$NORMAL_MACHINE"
 wait_for_host_docker "$DOCKER_SOCKET"
 wait_for_http "$NORMAL_PORT"
 verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT"
+stop_machine "$NORMAL_MACHINE"
+NORMAL_RUNNING=0
+
+# A valid JSON configuration can fail later during BuildKit initialization.
+# The actual daemon error must reach the retained console, even after it exits.
+cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
+{"builder":{"gc":{"enabled":true,"defaultMinFreeSpace":"not-a-size"}}}
+JSON
+"$SMOLVM_BIN" machine start --name "$NORMAL_MACHINE"
+NORMAL_RUNNING=1
+STARTUP_ERROR_CAPTURED=0
+for _attempt in $(seq 1 30); do
+    if grep -Fq 'failed to parse defaultMINFREESPACE' "$NORMAL_DATA_DIR/agent-console.log"; then
+        STARTUP_ERROR_CAPTURED=1
+        break
+    fi
+    sleep 1
+done
+[[ "$STARTUP_ERROR_CAPTURED" == 1 ]] || fail "Docker BuildKit startup failure was not retained in the console"
+stop_machine "$NORMAL_MACHINE"
+NORMAL_RUNNING=0
+cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
+{"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
+JSON
+"$SMOLVM_BIN" machine start --name "$NORMAL_MACHINE"
+NORMAL_RUNNING=1
+wait_for_guest_docker "$NORMAL_MACHINE"
+wait_for_host_docker "$DOCKER_SOCKET"
+wait_for_http "$NORMAL_PORT"
 stop_machine "$NORMAL_MACHINE"
 NORMAL_RUNNING=0
 
