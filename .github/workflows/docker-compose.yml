@@ -104,8 +104,24 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, raw]
     timeout-minutes: 45
     steps:
-      - name: Install Git LFS for checkout
-        run: brew install git-lfs
+      - name: Check Git LFS for checkout
+        shell: bash
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1 || ! git lfs version >/dev/null 2>&1; then
+            echo "::error::Git LFS is unavailable in the runner service environment (PATH=$PATH)."
+            cat >&2 <<'EOF'
+          Install Git LFS manually from https://git-lfs.com/ (Mac - Apple Silicon).
+          As the runner service user, run these commands from the actions-runner directory:
+            ./svc.sh stop
+            mkdir -p tools/bin
+            install -m 0755 /path/to/extracted/git-lfs tools/bin/git-lfs
+            printf '%s\n' "$PWD/tools/bin:$(cat .path)" > .path
+            env PATH="$(cat .path)" /bin/bash --noprofile --norc -c 'git lfs version'
+            ./svc.sh start
+          The service reads PATH from actions-runner/.path; changing a shell profile alone is insufficient.
+          EOF
+            exit 1
+          fi
 
       - uses: actions/checkout@v6
         with:
@@ -116,8 +132,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install host clients and image tools
-        run: brew install docker docker-compose e2fsprogs socat
+      - name: Check host clients and image tools
+        run: |
+          missing=()
+          for tool in docker socat curl python3; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+            missing+=("docker-compose or the Docker Compose plugin")
+          fi
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing runner service tools: ${missing[*]} (PATH=$PATH)."
+            echo "Install these tools manually and add their directories to actions-runner/.path, then restart with ./svc.sh stop and ./svc.sh start." >&2
+            echo "See examples/docker-compose/README.md#self-hosted-macos-runner-setup." >&2
+            exit 1
+          fi
 
       - uses: actions/download-artifact@v8
         with:
