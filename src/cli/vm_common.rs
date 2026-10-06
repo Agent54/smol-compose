@@ -2461,8 +2461,8 @@ fn mount_socket_placeholder_paths(record: &VmRecord) -> Vec<std::path::PathBuf> 
 
 /// Remove mount-socket placeholder files this machine left in shared `--volume`
 /// dirs (see [`mount_socket_placeholder_paths`]), except any `claimed` by
-/// another machine. Best-effort housekeeping: failures are debug-logged, never
-/// fatal to machine deletion.
+/// another machine. Without an ownership record these nodes are only inspected
+/// and retained; file size alone cannot prove that the agent created them.
 fn remove_mount_socket_placeholders_except(
     record: &VmRecord,
     claimed: &std::collections::HashSet<std::path::PathBuf>,
@@ -2471,29 +2471,17 @@ fn remove_mount_socket_placeholders_except(
         if claimed.contains(&placeholder) {
             continue;
         }
-        // Only ever remove provably-inert nodes: zero-byte *regular files*, not
-        // symlinks. Anything else at that path is the user's, not ours.
+        // Only inspect zero-byte regular files; all other nodes are unrelated
+        // user data. Even these candidates need an ownership record.
         let Ok(meta) = std::fs::symlink_metadata(&placeholder) else {
             continue; // never created, or already gone
         };
         if !meta.file_type().is_file() || meta.len() != 0 {
             continue;
         }
-        match std::fs::remove_file(&placeholder) {
-            Ok(()) => {
-                tracing::debug!(
-                    path = %placeholder.display(),
-                    "removed mount-socket placeholder from shared volume"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %placeholder.display(),
-                    error = %e,
-                    "failed to remove mount-socket placeholder"
-                );
-            }
-        }
+        // Empty files may predate the socket mount. Retain them until agent
+        // ownership is recorded; unlink also follows mutable parent symlinks.
+        tracing::debug!(path = %placeholder.display(), "retaining untracked shared socket placeholder");
     }
 }
 
@@ -2503,8 +2491,8 @@ fn remove_mount_socket_placeholders_except(
 /// The claim check is load-bearing, not just tidiness: over virtiofs, removing
 /// the placeholder on the host invalidates the mountpoint dentry of a *running*
 /// VM that bind-mounted over it, severing its guest path with ENOENT. A
-/// placeholder is inert once every machine declaring the same path is deleted,
-/// so cleanup converges instead of racing co-mounted machines.
+/// placeholder can be unused once every declaring machine is deleted, but an
+/// empty file cannot prove agent ownership, so it is retained.
 pub fn remove_mount_socket_placeholders(record: &VmRecord) {
     let claimed: std::collections::HashSet<std::path::PathBuf> = match SmolvmConfig::load() {
         Ok(cfg) => cfg
@@ -4045,7 +4033,7 @@ mod mount_socket_placeholder_tests {
     }
 
     #[test]
-    fn removes_only_inert_placeholder_files() {
+    fn preserves_untracked_empty_files_and_user_data() {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().join("shared");
         std::fs::create_dir_all(&share).unwrap();
@@ -4077,7 +4065,10 @@ mod mount_socket_placeholder_tests {
         );
         remove_placeholders(&record);
 
-        assert!(!placeholder.exists(), "inert 0-byte placeholder must go");
+        assert!(
+            placeholder.exists(),
+            "empty files do not prove agent ownership"
+        );
         assert!(user_data.exists(), "user data must survive");
         assert!(dir.is_dir(), "directories must survive");
     }
@@ -4132,7 +4123,10 @@ mod mount_socket_placeholder_tests {
         ));
         remove_placeholders(&record);
 
-        assert!(!real.exists(), "deepest volume's placeholder must go");
+        assert!(
+            real.exists(),
+            "untracked files must survive in the deepest volume"
+        );
         assert!(shallow_file.exists(), "shallow mapping's file must survive");
     }
 
@@ -4168,11 +4162,11 @@ mod mount_socket_placeholder_tests {
             "placeholder must survive while another machine claims it"
         );
 
-        // Once B is the last one left, its delete cleans up.
+        // Even the last machine cannot prove that an empty file is agent-owned.
         remove_mount_socket_placeholders_except(&record_b, &HashSet::new());
         assert!(
-            !placeholder.exists(),
-            "last machine's delete removes the placeholder"
+            placeholder.exists(),
+            "last machine's delete preserves untracked files"
         );
     }
 
@@ -4187,5 +4181,24 @@ mod mount_socket_placeholder_tests {
             vec![mount_sock("/run/control/engine.sock")],
         );
         remove_placeholders(&record); // nothing present: no failure
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_does_not_unlink_host_files_through_parent_symlinks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let share = fixture.path().join("share");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&share).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("engine.sock"), b"").unwrap();
+        std::os::unix::fs::symlink(&outside, share.join("escape")).unwrap();
+        let record = record_with(
+            &share,
+            "/share",
+            vec![mount_sock("/share/escape/engine.sock")],
+        );
+        remove_placeholders(&record);
+        assert!(outside.join("engine.sock").exists());
     }
 }

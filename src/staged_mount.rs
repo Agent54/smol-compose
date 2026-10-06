@@ -89,6 +89,26 @@ fn apply_archive(archive_path: &Path, destination: &Path) -> Result<()> {
         }
     }
 
+    // Reject children below archive symlinks before any host mutation. The
+    // extractor's escape check cannot undo an earlier destination deletion.
+    let links: HashSet<_> = desired_types
+        .iter()
+        .filter(|(_, kind)| kind.is_symlink())
+        .map(|(path, _)| path.clone())
+        .collect();
+    for (path, _) in &desired_types {
+        if path
+            .ancestors()
+            .skip(1)
+            .any(|parent| links.contains(parent))
+        {
+            return Err(Error::agent(
+                "sync staged mount",
+                "archive traverses a symlink",
+            ));
+        }
+    }
+
     drop(archive);
     let file = std::fs::File::open(archive_path)
         .map_err(|error| Error::agent("reopen staged archive", error.to_string()))?;
@@ -148,6 +168,22 @@ fn apply_archive(archive_path: &Path, destination: &Path) -> Result<()> {
 }
 
 fn prepare_entry_destination(root: &Path, relative: &Path, desired: tar::EntryType) -> Result<()> {
+    // Check existing parents before touching the destination. tar::unpack_in
+    // validates later, after this function can replace files and directories.
+    let mut parent = root.to_path_buf();
+    if let Some(parents) = relative.parent() {
+        for component in parents.components() {
+            parent.push(component);
+            if let Ok(metadata) = std::fs::symlink_metadata(&parent) {
+                if metadata.file_type().is_symlink() {
+                    return Err(Error::agent(
+                        "sync staged mount",
+                        "destination traverses a symlink",
+                    ));
+                }
+            }
+        }
+    }
     let path = root.join(relative);
     let Ok(existing) = std::fs::symlink_metadata(&path) else {
         return Ok(());
@@ -217,6 +253,49 @@ fn remove_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn append_link(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &Path) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder.append_link(&mut header, path, target).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_preparation_cannot_delete_through_existing_parent_link() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("share");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("keep");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        let archive = fixture.path().join("contents.tar");
+        let mut builder = tar::Builder::new(Vec::new());
+        append_link(&mut builder, "escape/keep", Path::new("replacement"));
+        std::fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+        assert!(apply_archive(&archive, &root).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_link_with_children_is_rejected_before_mutation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("share");
+        std::fs::create_dir(&root).unwrap();
+        let archive = fixture.path().join("contents.tar");
+        let mut builder = tar::Builder::new(Vec::new());
+        append_link(&mut builder, "escape", Path::new("../outside"));
+        append_link(&mut builder, "escape/keep", Path::new("replacement"));
+        std::fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+        assert!(apply_archive(&archive, &root).is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 
     #[test]
     fn mirror_updates_creates_and_deletes_without_following_symlinks() {

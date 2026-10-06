@@ -53,6 +53,18 @@ pub fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
     }
 }
 
+// Whiteout payloads are filenames, not paths. `.wh..` and `.wh...` must
+// never turn the layer directory or its parent into a deletion target.
+fn whiteout_path(parent: &Path, removed: &str) -> std::io::Result<PathBuf> {
+    if removed.is_empty() || matches!(removed, "." | "..") || removed.contains(['/', '\\', '\0']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "whiteout target must be a single filename",
+        ));
+    }
+    Ok(parent.join(removed))
+}
+
 /// Join `rel` under `base`, returning `None` if any component would escape the
 /// base — lexically (`..`, an absolute path, a Windows-style prefix) **or**
 /// through a symlink already on disk.
@@ -307,8 +319,9 @@ pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::
                 }
                 LayerEntry::Whiteout(removed) => {
                     if let Some(parent) = full_path.parent() {
+                        let target = whiteout_path(parent, removed)?;
                         std::fs::create_dir_all(parent)?;
-                        create_overlay_whiteout(&parent.join(removed))?;
+                        create_overlay_whiteout(&target)?;
                     }
                     continue;
                 }
@@ -396,6 +409,50 @@ pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_whiteouts_cannot_delete_a_directory_or_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layer = temporary.path().join("layer");
+        std::fs::create_dir(&layer).unwrap();
+        let sentinel = temporary.path().join("keep");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        for marker in [".wh..", ".wh..."] {
+            let LayerEntry::Whiteout(removed) = classify_layer_entry(marker) else {
+                panic!("expected marker")
+            };
+            assert!(whiteout_path(&layer, removed).is_err());
+        }
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(
+            whiteout_path(&layer, "ordinary").unwrap(),
+            layer.join("ordinary")
+        );
+    }
+
+    #[test]
+    fn extraction_rejects_parent_whiteout_before_any_deletion() {
+        for name in [".wh..", ".wh..."] {
+            let temporary = tempfile::tempdir().unwrap();
+            let layer = temporary.path().join("layer");
+            std::fs::create_dir(&layer).unwrap();
+            let sentinel = temporary.path().join("keep");
+            std::fs::write(&sentinel, b"keep").unwrap();
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, std::io::empty())
+                .unwrap();
+            let data = archive.into_inner().unwrap();
+            let error = extract_oci_layer(data.as_slice(), &layer).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+            assert!(layer.is_dir());
+        }
+    }
 
     #[test]
     fn classify_recognizes_markers_and_normals() {
