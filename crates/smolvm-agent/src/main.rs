@@ -3065,8 +3065,11 @@ fn handle_file_write(
 /// ever appears at the target path.
 struct WriteSession {
     /// User-requested target path inside the guest.
+    guest_path: String,
+    /// Target resolved in the agent's filesystem, used for staging and for
+    /// installation when no workload container is running.
     target: std::path::PathBuf,
-    /// Staging file we append to; renamed to `target` on done.
+    /// Agent-side staging file; copied into the workload or renamed to `target`.
     tmp_path: std::path::PathBuf,
     /// Handle we keep open for the lifetime of the session.
     tmp_file: std::fs::File,
@@ -3084,8 +3087,10 @@ struct WriteSession {
 }
 
 impl WriteSession {
-    /// Open a fresh staging file for `target`.
+    /// Stage against the agent's resolved `target`, retaining the guest path
+    /// for installation inside the workload's filesystem.
     fn open(
+        guest_path: String,
         target: std::path::PathBuf,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -3117,6 +3122,7 @@ impl WriteSession {
             .truncate(true)
             .open(&tmp_path)?;
         Ok(Self {
+            guest_path,
             target,
             tmp_path,
             tmp_file,
@@ -3187,7 +3193,7 @@ impl WriteSession {
                 if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
                     // Session Drop still cleans the staging file.
                     return match ns.write_reader(
-                        &self.target.to_string_lossy(),
+                        &self.guest_path,
                         &mut staged,
                         self.mode,
                         self.uid,
@@ -3195,7 +3201,7 @@ impl WriteSession {
                     ) {
                         Ok(()) => {
                             info!(
-                                path = %self.target.display(),
+                                path = %self.guest_path,
                                 size = self.bytes_written,
                                 "file written into workload container"
                             );
@@ -3204,8 +3210,7 @@ impl WriteSession {
                         Err(e) => AgentResponse::error(
                             format!(
                                 "failed to write {} in the workload container: {}",
-                                self.target.display(),
-                                e
+                                self.guest_path, e
                             ),
                             error_codes::FILE_IO_FAILED,
                         ),
@@ -3288,7 +3293,7 @@ fn handle_file_write_begin(
         Ok(p) => p,
         Err(resp) => return (None, resp),
     };
-    match WriteSession::open(resolved, mode, uid, gid, total_size) {
+    match WriteSession::open(path, resolved, mode, uid, gid, total_size) {
         Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
         Err(e) => (
             None,

@@ -103,15 +103,21 @@ pub fn run_helper() -> i32 {
     }
 }
 
-/// Join `pid`'s mount namespace.
+/// Join `pid`'s mount namespace and adopt its root directory.
 ///
 /// The container carries no user namespace (the OCI spec requests only
 /// pid/mount/ipc/uts), so uid/gid stay meaningful across the switch and only the
-/// mount namespace has to be entered.
+/// mount namespace and filesystem root have to be entered.
 #[cfg(target_os = "linux")]
 fn enter_mount_namespace(pid: u32) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
     let ns = format!("/proc/{pid}/ns/mnt");
     let file = std::fs::File::open(&ns).map_err(|e| format!("open {ns}: {e}"))?;
+    // setns changes mounts, but keeps the caller's root directory. Open the
+    // workload root before switching: its /proc may use a different PID view.
+    let root_path = format!("/proc/{pid}/root");
+    let root = std::fs::File::open(&root_path).map_err(|e| format!("open {root_path}: {e}"))?;
     // SAFETY: `fd` is a live descriptor for a mount-namespace file; setns only
     // reads it. Single-threaded by construction (dispatched before any thread).
     let rc = unsafe {
@@ -123,8 +129,17 @@ fn enter_mount_namespace(pid: u32) -> Result<(), String> {
     if rc != 0 {
         return Err(format!("setns({ns}): {}", std::io::Error::last_os_error()));
     }
-    // The old cwd belongs to the namespace we just left; a relative path or a
-    // `..` walk from it would resolve outside the container.
+    // Resolve absolute paths and symlinks against the workload's root, not the
+    // agent's old root (which setns leaves accessible).
+    // SAFETY: root owns a live directory descriptor; this single-threaded
+    // helper changes only its own cwd before chrooting to that directory.
+    if unsafe { libc::fchdir(root.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "fchdir {root_path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    std::os::unix::fs::chroot(".").map_err(|e| format!("chroot {root_path}: {e}"))?;
     std::env::set_current_dir("/").map_err(|e| format!("chdir /: {e}"))?;
     Ok(())
 }

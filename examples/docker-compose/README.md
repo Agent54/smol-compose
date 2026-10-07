@@ -33,6 +33,11 @@ restart, pack, and embedded-artifact test:
 ./examples/docker-compose/verify.sh
 ```
 
+The check also uploads files of 1 MiB, 1 MiB plus one byte, and multiple chunks
+to `/tmp`, `/workspace`, and `/opt` while another overlay is prepared. It checks
+the destination from the running workload, along with file contents,
+permissions, ownership, and download results.
+
 The script creates unique test machines and keeps every generated database,
 disk, log, staging file, artifact, and socket below the ignored
 `examples/docker-compose/.state/` directory. It stops and deletes only the

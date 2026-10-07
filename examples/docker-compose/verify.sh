@@ -189,9 +189,21 @@ verify_paths() {
     local docker_socket="$1"
     local vm_socket="$2"
     local port="$3"
+    local machine="$4"
     local port_result
     local host_to_vm_result
     local vm_to_host_result
+
+    # Exposed sockets must work without importing the agent's /run. Only the
+    # requested host socket belongs in the workload's private runtime directory.
+    "$SMOLVM_BIN" machine exec --name "$machine" -- sh -ec '
+        test ! -e /run/smolvm/published-sockets
+        test -S /run/smol-compose-evaluation/host.sock
+    ' || fail "workload /run isolation or host socket mount failed in $machine"
+    printf '  ok: private workload /run and individual host socket mount\n'
+
+    python3 "$SCRIPT_DIR/fixtures/file_upload_probe.py" "$SMOLVM_BIN" "$machine" "$STATE_DIR" \
+        --image docker:28-dind
 
     port_result="$(curl --fail --silent --show-error "http://127.0.0.1:$port")"
     host_to_vm_result="$(compose_for "$docker_socket" exec -T app python -c \
@@ -316,7 +328,7 @@ compose_for "$DOCKER_SOCKET" up -d --wait
 NORMAL_COMPOSE=1
 NORMAL_DATA_DIR="$("$SMOLVM_BIN" machine data-dir --name "$NORMAL_MACHINE")"
 grep -Fq 'Starting up' "$NORMAL_DATA_DIR/agent-console.log" || fail "Docker startup output was discarded"
-verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT"
+verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT" "$NORMAL_MACHINE"
 
 printf '2/5 Restarting normal machine and rechecking persistence\n'
 stop_machine "$NORMAL_MACHINE"
@@ -326,7 +338,7 @@ NORMAL_RUNNING=1
 wait_for_guest_docker "$NORMAL_MACHINE"
 wait_for_host_docker "$DOCKER_SOCKET"
 wait_for_http "$NORMAL_PORT"
-verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT"
+verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT" "$NORMAL_MACHINE"
 stop_machine "$NORMAL_MACHINE"
 NORMAL_RUNNING=0
 
@@ -389,7 +401,7 @@ compose_for "$EMBEDDED_DOCKER_SOCKET" up -d --wait
 EMBEDDED_COMPOSE=1
 
 printf '5/5 Verifying embedded Compose paths\n'
-verify_paths "$EMBEDDED_DOCKER_SOCKET" "$EMBEDDED_VM_SOCKET" "$EMBEDDED_PORT"
+verify_paths "$EMBEDDED_DOCKER_SOCKET" "$EMBEDDED_VM_SOCKET" "$EMBEDDED_PORT" "$EMBEDDED_MACHINE"
 
 if [[ "$EXPORT_PACK" == 1 ]]; then
     cp -- "$PACK_OUTPUT.smolmachine" "$EXPORTED_PACK"
