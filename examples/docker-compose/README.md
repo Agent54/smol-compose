@@ -63,7 +63,7 @@ permissions, ownership, and download results.
 
 The script creates unique test machines and keeps every generated database,
 disk, log, staging file, artifact, and socket below the ignored
-`examples/docker-compose/.state/` directory. It stops and deletes only the
+`examples/docker-compose/state/` directory. It stops and deletes only the
 unique machines it created after a successful run. Set `KEEP_STATE=1` to keep
 the machines and packed artifact for inspection. Set `SMOLVM=/path/to/smolvm`
 to test a distribution binary instead of `target/release/smolvm`.
@@ -86,14 +86,14 @@ Docker reloads the bundled archive. Mutable image tags are never used to select
 the builder. No host code calculates Docker's internal image identity.
 
 On macOS CI checkouts whose absolute path would exceed the Unix-socket limit,
-the script temporarily addresses that same `.state` directory through a short,
+the script temporarily addresses that same `state` directory through a short,
 PID-scoped symlink in `/tmp`. The symlink is removed on exit; all state and
-socket filesystem objects remain physically inside the ignored `.state`
+socket filesystem objects remain physically inside the ignored `state`
 directory.
 
 Set `EXPORT_PACK=1` to retain the verified sidecar at the fixed,
 platform-qualified path
-`examples/docker-compose/.state/docker-compose-runtime-<os>-<arch>.smolmachine`.
+`examples/docker-compose/state/docker-compose-runtime-<os>-<arch>.smolmachine`.
 The script still removes its unique test machines, sockets, launcher, staging
 directory, and logs. Tagged-release CI uses this mode to publish the exact
 sidecar that passed the embedded-artifact test.
@@ -158,13 +158,13 @@ needed.
 Create the example's ignored runtime directory:
 
 ```sh
-mkdir -p examples/docker-compose/.state
+mkdir -p examples/docker-compose/state
 ```
 
 Keep the test machine database, disks, logs, and runtime sockets there too:
 
 ```sh
-export SMOLVM_DATA_DIR="$PWD/examples/docker-compose/.state"
+export SMOLVM_DATA_DIR="$PWD/examples/docker-compose/state"
 ```
 
 Use the same exported value for every `smolvm` command in this example.
@@ -172,7 +172,7 @@ Use the same exported value for every `smolvm` command in this example.
 In terminal 1, start a host socket that returns `host-to-vm-ok`:
 
 ```sh
-socat UNIX-LISTEN:"$PWD/examples/docker-compose/.state/host-to-vm.sock",fork SYSTEM:"printf 'host-to-vm-ok\\n'"
+socat UNIX-LISTEN:"$PWD/examples/docker-compose/state/host-to-vm.sock",fork SYSTEM:"printf 'host-to-vm-ok\\n'"
 ```
 
 Leave that process running.
@@ -190,12 +190,12 @@ Then create the machine from that artifact (Apple Silicon path shown):
 ```sh
 smolvm machine create \
   --name docker-compose-evaluation \
-  --from examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine \
+  --from examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine \
   --net-backend virtio-net \
   --port 18080:8080 \
-  --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/.state/docker.sock" \
-  --mount-socket "$PWD/examples/docker-compose/.state/host-to-vm.sock:/run/smol-compose-evaluation/host.sock" \
-  --expose-socket "/run/smol-compose-evaluation/guest.sock:$PWD/examples/docker-compose/.state/vm-to-host.sock"
+  --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/state/docker.sock" \
+  --mount-socket "$PWD/examples/docker-compose/state/host-to-vm.sock:/run/smol-compose-evaluation/host.sock" \
+  --expose-socket "/run/smol-compose-evaluation/guest.sock:$PWD/examples/docker-compose/state/vm-to-host.sock"
 ```
 
 ```sh
@@ -226,7 +226,7 @@ Set `DOCKER_HOST` to the socket exposed in the example's ignored state
 directory:
 
 ```sh
-export DOCKER_HOST="unix://$PWD/examples/docker-compose/.state/docker.sock"
+export DOCKER_HOST="unix://$PWD/examples/docker-compose/state/docker.sock"
 ```
 
 Confirm that the client reaches the daemon inside the VM:
@@ -276,7 +276,7 @@ Host through the exposed VM socket to the Compose container:
 
 ```sh
 deno run --no-config --allow-read --allow-write --allow-net examples/docker-compose/fixtures/socket_probe.ts \
-  examples/docker-compose/.state/vm-to-host.sock vm-to-host-ok
+  examples/docker-compose/state/vm-to-host.sock vm-to-host-ok
 ```
 
 Expected output:
@@ -303,7 +303,7 @@ EXPORT_PACK=1 ./examples/docker-compose/verify.sh
 ```
 
 The result includes
-`examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine`
+`examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine`
 and its `.builder.lock` metadata. An
 embedded distribution can ship that sidecar and create a ready-to-start
 machine without pulling the Docker image:
@@ -311,12 +311,12 @@ machine without pulling the Docker image:
 ```sh
 smolvm machine create \
   --name docker-compose-evaluation \
-  --from examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine \
+  --from examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine \
   --net-backend virtio-net \
   --port 18080:8080 \
-  --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/.state/docker.sock" \
-  --mount-socket "$PWD/examples/docker-compose/.state/host-to-vm.sock:/run/smol-compose-evaluation/host.sock" \
-  --expose-socket "/run/smol-compose-evaluation/guest.sock:$PWD/examples/docker-compose/.state/vm-to-host.sock"
+  --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/state/docker.sock" \
+  --mount-socket "$PWD/examples/docker-compose/state/host-to-vm.sock:/run/smol-compose-evaluation/host.sock" \
+  --expose-socket "/run/smol-compose-evaluation/guest.sock:$PWD/examples/docker-compose/state/vm-to-host.sock"
 ```
 
 The Docker socket endpoint, arbitrary socket endpoints, host mounts, and host ports

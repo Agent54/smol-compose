@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
-STATE_DIR="$SCRIPT_DIR/.state"
+STATE_DIR="$SCRIPT_DIR/state"
 SMOLVM_BIN="${SMOLVM:-$REPO_ROOT/target/release/smolvm}"
 SMOLFILE="$SCRIPT_DIR/docker-compose.smolfile"
 source "$SCRIPT_DIR/builder/ContainerTools.lock"

@@ -78,23 +78,23 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: compose-agent-aarch64
-          path: examples/docker-compose/.state/ci-agent-${{ github.run_id }}.dir
+          path: examples/docker-compose/state/ci-agent-${{ github.run_id }}.dir
 
       - name: Build rootfs from the current agent
         run: |
-          chmod +x examples/docker-compose/.state/ci-agent-${{ github.run_id }}.dir/smolvm-agent
-          AGENT_BINARY="$PWD/examples/docker-compose/.state/ci-agent-${{ github.run_id }}.dir/smolvm-agent" \
+          chmod +x examples/docker-compose/state/ci-agent-${{ github.run_id }}.dir/smolvm-agent
+          AGENT_BINARY="$PWD/examples/docker-compose/state/ci-agent-${{ github.run_id }}.dir/smolvm-agent" \
             ./scripts/build-agent-rootfs.sh \
               --arch aarch64 \
               --no-build-agent \
-              examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
-          tar -cf examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.tar \
-            -C examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir .
+              examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.dir
+          tar -cf examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.tar \
+            -C examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.dir .
 
       - uses: actions/upload-artifact@v7
         with:
           name: compose-rootfs-aarch64
-          path: examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.tar
+          path: examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.tar
           if-no-files-found: error
 
   verify:
@@ -151,13 +151,13 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: compose-rootfs-aarch64
-          path: examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.download
+          path: examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.download
 
       - name: Extract guest rootfs
         run: |
-          mkdir -p examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
-          tar -xf examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.download/ci-rootfs-${{ github.run_id }}.tar \
-            -C examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
+          mkdir -p examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.dir
+          tar -xf examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.download/ci-rootfs-${{ github.run_id }}.tar \
+            -C examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.dir
 
       - name: Build and sign SmolVM
         run: |
@@ -168,21 +168,20 @@ jobs:
         run: ./examples/docker-compose/verify.sh
         env:
           EXPORT_PACK: '1'
-          SMOLVM_AGENT_ROOTFS: ${{ github.workspace }}/examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
+          SMOLVM_AGENT_ROOTFS: ${{ github.workspace }}/examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.dir
           SMOLVM_LIB_DIR: ${{ github.workspace }}/lib
           LIBKRUN_BUNDLE: ${{ github.workspace }}/lib
 
       - uses: actions/upload-artifact@v7
         with:
           name: docker-compose-runtime-darwin-arm64
-          path: examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine*
+          path: examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine*
           if-no-files-found: error
-          include-hidden-files: true
 
       - name: Remove workflow-owned state
         if: always()
         run: |
-          rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine
-          rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine.builder.lock
-          rm -rf -- examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.download
-          rm -rf -- examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir
+          rm -f -- examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine
+          rm -f -- examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine.builder.lock
+          rm -rf -- examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.download
+          rm -rf -- examples/docker-compose/state/ci-rootfs-${{ github.run_id }}.dir

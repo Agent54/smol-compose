@@ -7,7 +7,7 @@ source "$script_dir/builder/ContainerTools.lock"
 smolvm="${SMOLVM:?Set SMOLVM to the runtime executable}"
 crane="${CRANE:-crane}"
 output="${1:?usage: prepare-runtime.sh OUTPUT_EXECUTABLE}"
-state="$script_dir/.state/builder-assets"
+state="$script_dir/state/builder-assets"
 buildkit_archive="$state/buildkit-${BUILDKIT_IMAGE##*@}.tar"
 mkdir -p "$state" "$(dirname "$output")"
 case "$(uname -m)" in arm64|aarch64) ;; *) echo 'This image definition targets ARM64' >&2; exit 1 ;; esac

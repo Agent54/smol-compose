@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repository="$(cd "$(dirname "$0")/.." && pwd)"
-mkdir -p "$repository/examples/docker-compose/.state"
-fixture_parent="$(mktemp -d "$repository/examples/docker-compose/.state/input-tests.XXXXXX")"
+mkdir -p "$repository/examples/docker-compose/state"
+fixture_parent="$(mktemp -d "$repository/examples/docker-compose/state/input-tests.XXXXXX")"
 readonly fixture_parent
 fixture="$fixture_parent/runtime-inputs.fixture"
 readonly fixture
 trap 'rm -rf -- "${fixture_parent:?}/runtime-inputs.fixture"; rmdir -- "${fixture_parent:?}"' EXIT
-mkdir -p "$fixture/builder" "$fixture/bin" "$fixture/.state/builder-assets"
+mkdir -p "$fixture/builder" "$fixture/bin" "$fixture/state/builder-assets"
 cp "$repository/examples/docker-compose/prepare-runtime.sh" "$fixture/"
 cp "$repository/examples/docker-compose/builder/"* "$fixture/builder/"
-printf buildx > "$fixture/.state/builder-assets/buildx-vtest"
-buildx_checksum="$(shasum -a 256 "$fixture/.state/builder-assets/buildx-vtest" | awk '{print $1}')"
+printf buildx > "$fixture/state/builder-assets/buildx-vtest"
+buildx_checksum="$(shasum -a 256 "$fixture/state/builder-assets/buildx-vtest" | awk '{print $1}')"
 first_digest="$(printf first | shasum -a 256 | awk '{print $1}')"
 second_digest="$(printf second | shasum -a 256 | awk '{print $1}')"
 printf 'image = "docker:test@sha256:%s"\n' "$first_digest" > "$fixture/docker-compose.smolfile"

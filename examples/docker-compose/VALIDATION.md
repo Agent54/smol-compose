@@ -17,7 +17,7 @@ It contains:
 acaa84066ca78f07d47a7e1358e12e90ac6f5b54b6c3344b5bd98d343e26b9bc  smolvm-1.13.0-docker-compose-darwin-arm64.smolmachine
 ```
 
-The Darwin runtime archive was built in the example's ignored `.state`
+The Darwin runtime archive was built in the example's ignored `state`
 directory from the exact CI-built static ARM64 agent/rootfs and the repository's
 bundled libkrun. Validation confirmed:
 
@@ -54,7 +54,7 @@ compose ...` control path used by the Swift guide.
 
 All validation databases, disks, downloaded CI artifacts, build staging,
 release artifacts, logs, and sockets were confined to the ignored
-`examples/docker-compose/.state/` directory. No validation machines remain.
+`examples/docker-compose/state/` directory. No validation machines remain.
 
 ## Source and libkrun checks
 
