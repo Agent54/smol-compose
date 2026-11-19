@@ -33,7 +33,7 @@ runtime and runs Compose inside the VM, see
 The previous Apple Silicon integration prerelease is
 [`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1).
 It predates the embedded BuildKit image and cannot be used by consumers that
-require `containerd-buildkit-1` metadata. Build this revision through the
+require `containerd-buildkit-2` metadata. Build this revision through the
 verification pipeline below until a matching component release is published.
 
 It validates all of the paths needed by a local Compose backend:
@@ -76,9 +76,9 @@ again. It is a build input, not a migration path for a running user's VM.
 the Compose fixture images. Verification loads it into each test VM and disables
 pulling, so repeated tests do not redownload the Python fixture.
 
-The builder lock records both the verified BuildKit configuration digest and
-the manifest identity produced when Docker's containerd store imports the
-bundled archive. Builder selection uses the manifest identity.
+The builder lock pins the BuildKit registry reference. Crane validates the
+bundled archive; on the first build, Docker loads it and supplies the image ID
+used by Buildx. No host code calculates Docker's internal image identity.
 
 On macOS CI checkouts whose absolute path would exceed the Unix-socket limit,
 the script temporarily addresses that same `.state` directory through a short,
@@ -141,7 +141,7 @@ Homebrew `bin` directory. Keep any Homebrew `bin` entries out of `.path` if the
 service must not be able to invoke `brew`. Do not run macOS `svc.sh` with sudo.
 
 Provision `docker`, `docker-compose` (or the Docker Compose plugin), `socat`,
-`curl`, `crane`, and Python 3 the same way: their executable directories must be in
+`curl`, `crane`, and Deno the same way: their executable directories must be in
 `.path`, and the service must be restarted after changes. The integration job
 also needs e2fsprogs for `mkfs.ext4`; SmolVM searches the standard installation
 paths, or you can expose its `sbin` directory through `.path`. The release job
@@ -270,7 +270,7 @@ host-to-vm-ok
 Host through the exposed VM socket to the Compose container:
 
 ```sh
-python3 examples/docker-compose/fixtures/socket_probe.py \
+deno run --no-config --allow-read --allow-write --allow-net examples/docker-compose/fixtures/socket_probe.ts \
   examples/docker-compose/.state/vm-to-host.sock vm-to-host-ok
 ```
 

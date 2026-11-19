@@ -19,13 +19,12 @@ fi
 [[ "$(shasum -a 256 "$state/buildx-v$BUILDX_VERSION" | awk '{print $1}')" = "$BUILDX_LINUX_ARM64_SHA256" ]]
 if [[ ! -f "$state/buildkit-v$BUILDKIT_VERSION.tar" ]]; then
     "$crane" pull --platform linux/arm64 --format tarball "$BUILDKIT_IMAGE" "$state/buildkit-v$BUILDKIT_VERSION.tar.download"
-    python3 "$script_dir/builder/verify-archive.py" "$state/buildkit-v$BUILDKIT_VERSION.tar.download" "$BUILDKIT_CONFIG_ID" >/dev/null
+    "$crane" validate --tarball "$state/buildkit-v$BUILDKIT_VERSION.tar.download"
     mv "$state/buildkit-v$BUILDKIT_VERSION.tar.download" "$state/buildkit-v$BUILDKIT_VERSION.tar"
 fi
-buildkit_image_id="$(python3 "$script_dir/builder/verify-archive.py" "$state/buildkit-v$BUILDKIT_VERSION.tar" "$BUILDKIT_CONFIG_ID")"
+"$crane" validate --tarball "$state/buildkit-v$BUILDKIT_VERSION.tar"
 cp "$script_dir/builder/ContainerTools.lock" "$script_dir/builder/prepare-builder.sh" \
     "$script_dir/builder/cache.sh" "$script_dir/builder/buildkitd.toml" "$script_dir/builder/daemon.json" "$state/"
-printf 'BUILDKIT_IMAGE_ID=%s\n' "$buildkit_image_id" >> "$state/ContainerTools.lock"
 # An explicit pristine build artifact avoids downloading its base layers again.
 # The assembly below reapplies the current recipe; this never upgrades a user's VM.
 base_image="$(sed -n 's/^image = "\(.*\)"/\1/p' "$script_dir/docker-compose.smolfile")"
@@ -67,7 +66,7 @@ created=0
     --output "$output" --staging-dir "$state/pack"
 {
     cat "$state/ContainerTools.lock"
-    printf 'SMOLVM_RUNTIME_FORMAT=containerd-buildkit-1\n'
+    printf 'SMOLVM_RUNTIME_FORMAT=containerd-buildkit-2\n'
     printf 'SMOLVM_COMPOSE_SHA256=%s\n' "$(shasum -a 256 "$output.smolmachine" | awk '{print $1}')"
     printf 'SMOLVM_COMPOSE_SOURCE_REVISION=%s\n' "$(git -C "$script_dir" describe --always --dirty)"
 } > "$output.smolmachine.builder.lock"

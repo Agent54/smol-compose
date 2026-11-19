@@ -225,13 +225,13 @@ verify_paths() {
     ' || fail "workload /run isolation or host socket mount failed in $machine"
     printf '  ok: private workload /run and individual host socket mount\n'
 
-    python3 "$SCRIPT_DIR/fixtures/file_upload_probe.py" "$SMOLVM_BIN" "$machine" "$STATE_DIR" \
+    deno run --no-config --allow-read --allow-write --allow-net --allow-run "$SCRIPT_DIR/fixtures/file_upload_probe.ts" "$SMOLVM_BIN" "$machine" "$STATE_DIR" \
         --image "$(sed -n 's/^image = "\(.*\)"/\1/p' "$SMOLFILE")"
 
     port_result="$(curl --fail --silent --show-error "http://127.0.0.1:$port")"
     host_to_vm_result="$(compose_for "$docker_socket" exec -T app python -c \
         'import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect("/run/smol-compose-evaluation/host.sock"); s.sendall(b"probe\n"); s.shutdown(socket.SHUT_WR); print(s.recv(4096).decode().strip())')"
-    vm_to_host_result="$(python3 "$SCRIPT_DIR/fixtures/socket_probe.py" "$vm_socket" vm-to-host-ok)"
+    vm_to_host_result="$(deno run --no-config --allow-read --allow-write --allow-net "$SCRIPT_DIR/fixtures/socket_probe.ts" "$vm_socket" vm-to-host-ok)"
 
     assert_output port-exposure-ok "$port_result" "host TCP -> Compose"
     assert_output host-to-vm-ok "$host_to_vm_result" "Compose -> host Unix socket"
@@ -244,7 +244,7 @@ require_command docker
 require_command "${CRANE:-crane}"
 require_command socat
 require_command curl
-require_command python3
+require_command deno
 require_command seq
 
 if command -v docker-compose >/dev/null 2>&1; then
@@ -352,7 +352,7 @@ wait_for_guest_docker "$NORMAL_MACHINE"
 wait_for_host_docker "$DOCKER_SOCKET"
 "$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" -- sh -ec '
     . /usr/local/share/xe-builder/ContainerTools.lock
-    test -z "$(docker image ls -q "$BUILDKIT_IMAGE_ID")"
+    test -z "$(docker image ls -q "xe-buildkit:$BUILDKIT_VERSION")"
     test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
     /usr/local/share/xe-builder/cache.sh prune --builder xe --force
     test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
@@ -363,7 +363,7 @@ NORMAL_DATA_DIR="$("$SMOLVM_BIN" machine data-dir --name "$NORMAL_MACHINE")"
 grep -Fq 'Starting up' "$NORMAL_DATA_DIR/agent-console.log" || fail "Docker startup output was discarded"
 verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT" "$NORMAL_MACHINE"
 "$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" --timeout 180s -- \
-    /usr/local/share/xe-builder/prepare-builder.sh "$DOCKER_VERSION" "$BUILDKIT_IMAGE_ID"
+    /usr/local/share/xe-builder/prepare-builder.sh "$DOCKER_VERSION" "$BUILDKIT_IMAGE"
 "$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" --timeout 180s -- sh -ec '
     mkdir -p /workspace/xe-build-probe
     printf "FROM scratch\nCOPY --link payload /payload\n" > /workspace/xe-build-probe/Dockerfile
@@ -443,7 +443,7 @@ wait_for_guest_docker "$EMBEDDED_MACHINE"
 wait_for_host_docker "$EMBEDDED_DOCKER_SOCKET"
 "$SMOLVM_BIN" machine exec --name "$EMBEDDED_MACHINE" -- sh -ec '
     . /usr/local/share/xe-builder/ContainerTools.lock
-    test -z "$(docker image ls -q "$BUILDKIT_IMAGE_ID")"
+    test -z "$(docker image ls -q "xe-buildkit:$BUILDKIT_VERSION")"
     test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
 '
 start_fixture "$EMBEDDED_DOCKER_SOCKET"
