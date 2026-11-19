@@ -19,19 +19,33 @@ fi
 [[ "$(shasum -a 256 "$state/buildx-v$BUILDX_VERSION" | awk '{print $1}')" = "$BUILDX_LINUX_ARM64_SHA256" ]]
 if [[ ! -f "$state/buildkit-v$BUILDKIT_VERSION.tar" ]]; then
     "$crane" pull --platform linux/arm64 --format tarball "$BUILDKIT_IMAGE" "$state/buildkit-v$BUILDKIT_VERSION.tar.download"
-    python3 "$script_dir/builder/verify-archive.py" "$state/buildkit-v$BUILDKIT_VERSION.tar.download" "$BUILDKIT_IMAGE_ID"
+    python3 "$script_dir/builder/verify-archive.py" "$state/buildkit-v$BUILDKIT_VERSION.tar.download" "$BUILDKIT_CONFIG_ID" >/dev/null
     mv "$state/buildkit-v$BUILDKIT_VERSION.tar.download" "$state/buildkit-v$BUILDKIT_VERSION.tar"
 fi
-python3 "$script_dir/builder/verify-archive.py" "$state/buildkit-v$BUILDKIT_VERSION.tar" "$BUILDKIT_IMAGE_ID"
+buildkit_image_id="$(python3 "$script_dir/builder/verify-archive.py" "$state/buildkit-v$BUILDKIT_VERSION.tar" "$BUILDKIT_CONFIG_ID")"
 cp "$script_dir/builder/ContainerTools.lock" "$script_dir/builder/prepare-builder.sh" \
     "$script_dir/builder/cache.sh" "$script_dir/builder/buildkitd.toml" "$script_dir/builder/daemon.json" "$state/"
+printf 'BUILDKIT_IMAGE_ID=%s\n' "$buildkit_image_id" >> "$state/ContainerTools.lock"
+# An explicit pristine build artifact avoids downloading its base layers again.
+# The assembly below reapplies the current recipe; this never upgrades a user's VM.
+base_image="$(sed -n 's/^image = "\(.*\)"/\1/p' "$script_dir/docker-compose.smolfile")"
+[[ -n "$base_image" ]]
+# Assembly uses only a shell; Docker must not create runtime state in the image.
+source_args=(--image "$base_image" --net --cpus 2 --mem 2048)
+if [[ -n "${SMOLVM_BUILD_BASE_ARTIFACT:-}" ]]; then
+    base="$SMOLVM_BUILD_BASE_ARTIFACT"
+    expected="$(sed -n 's/^SMOLVM_COMPOSE_SHA256=//p' "$base.builder.lock")"
+    [[ "$expected" =~ ^[0-9a-f]{64}$ && "$(shasum -a 256 "$base" | awk '{print $1}')" = "$expected" ]]
+    [[ "$(sed -n 's/^DOCKER_VERSION=//p' "$base.builder.lock")" = "$DOCKER_VERSION" ]]
+    source_args=(--from "$base")
+fi
 machine="compose-image-build-$$"
 created=0
 cleanup() {
     if [[ "$created" = 1 ]]; then "$smolvm" machine stop --name "$machine"; fi
 }
 trap cleanup EXIT
-"$smolvm" machine create --name "$machine" --smolfile "$script_dir/docker-compose.smolfile" \
+"$smolvm" machine create --name "$machine" "${source_args[@]}" \
     --net-backend virtio-net --volume "$state:/opt/image-build:ro" -- /bin/sh -c 'sleep 2147483647'
 created=1
 "$smolvm" machine start --name "$machine"
@@ -52,8 +66,8 @@ created=0
 "$smolvm" pack create --from-vm "$machine" --smolfile "$script_dir/docker-compose.smolfile" \
     --output "$output" --staging-dir "$state/pack"
 {
-    cat "$script_dir/builder/ContainerTools.lock"
-    printf 'SMOLVM_RUNTIME_FORMAT=embedded-buildkit-1\n'
+    cat "$state/ContainerTools.lock"
+    printf 'SMOLVM_RUNTIME_FORMAT=containerd-buildkit-1\n'
     printf 'SMOLVM_COMPOSE_SHA256=%s\n' "$(shasum -a 256 "$output.smolmachine" | awk '{print $1}')"
     printf 'SMOLVM_COMPOSE_SOURCE_REVISION=%s\n' "$(git -C "$script_dir" describe --always --dirty)"
 } > "$output.smolmachine.builder.lock"

@@ -86,6 +86,22 @@ compose_for() {
     DOCKER_HOST="unix://$socket_path" "${COMPOSE[@]}" -f "$COMPOSE_FILE" "$@"
 }
 
+# Explicit offline fixture input for repeated local verification on slow networks.
+# Require every Compose image to be present; never pull after loading this input.
+start_fixture() {
+    local socket_path="$1"
+    if [[ -n "${SMOLVM_VERIFY_IMAGE_ARCHIVE:-}" ]]; then
+        DOCKER_HOST="unix://$socket_path" docker image load --input "$SMOLVM_VERIFY_IMAGE_ARCHIVE"
+        local image
+        for image in $(compose_for "$socket_path" config --images); do
+            DOCKER_HOST="unix://$socket_path" docker image inspect "$image" >/dev/null
+        done
+        compose_for "$socket_path" up -d --wait --pull never
+    else
+        compose_for "$socket_path" up -d --wait
+    fi
+}
+
 cleanup() {
     set +e
     if [[ "$EMBEDDED_COMPOSE" == 1 && "$EMBEDDED_RUNNING" == 1 ]]; then
@@ -199,6 +215,11 @@ verify_paths() {
     # Exposed sockets must work without importing the agent's /run. Only the
     # requested host socket belongs in the workload's private runtime directory.
     "$SMOLVM_BIN" machine exec --name "$machine" -- sh -ec '
+        test "$(docker info --format "{{.Driver}}")" = overlayfs
+        docker info --format "{{json .DriverStatus}}" | grep -Fq io.containerd.snapshotter.v1
+        grep -Eq " /storage .* - ext4 " /proc/self/mountinfo
+        test -d /storage/docker/containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots
+        test "$(stat -c %d /storage/docker/containerd/daemon)" = "$(stat -c %d /storage)"
         test ! -e /run/smolvm/published-sockets
         test -S /run/smol-compose-evaluation/host.sock
     ' || fail "workload /run isolation or host socket mount failed in $machine"
@@ -308,11 +329,12 @@ done
 
 mkdir -p "$DAEMON_CONFIG_DIR"
 cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
-{"features":{"containerd-snapshotter":false},"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
+{"features":{"containerd-snapshotter":true},"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
 JSON
 
 printf '1/5 Creating normal Compose machine %s\n' "$NORMAL_MACHINE"
 SMOLVM="$SMOLVM_BIN" bash "$SCRIPT_DIR/prepare-runtime.sh" "$PACK_OUTPUT"
+source "$PACK_OUTPUT.smolmachine.builder.lock"
 "$SMOLVM_BIN" machine create \
     --name "$NORMAL_MACHINE" \
     --from "$PACK_OUTPUT.smolmachine" \
@@ -335,7 +357,7 @@ wait_for_host_docker "$DOCKER_SOCKET"
     /usr/local/share/xe-builder/cache.sh prune --builder xe --force
     test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
 '
-compose_for "$DOCKER_SOCKET" up -d --wait
+start_fixture "$DOCKER_SOCKET"
 NORMAL_COMPOSE=1
 NORMAL_DATA_DIR="$("$SMOLVM_BIN" machine data-dir --name "$NORMAL_MACHINE")"
 grep -Fq 'Starting up' "$NORMAL_DATA_DIR/agent-console.log" || fail "Docker startup output was discarded"
@@ -359,6 +381,7 @@ wait_for_guest_docker "$NORMAL_MACHINE"
 wait_for_host_docker "$DOCKER_SOCKET"
 "$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" -- sh -ec '
     test "$(docker inspect --format "{{.State.Running}}" buildx_buildkit_xe0)" = false
+    docker image inspect xe-build-probe >/dev/null
     /usr/local/share/xe-builder/cache.sh prune --builder xe --force
     test "$(docker inspect --format "{{.State.Running}}" buildx_buildkit_xe0)" = false
 '
@@ -370,7 +393,7 @@ NORMAL_RUNNING=0
 # A valid JSON configuration can fail later during BuildKit initialization.
 # The actual daemon error must reach the retained console, even after it exits.
 cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
-{"features":{"containerd-snapshotter":false},"builder":{"gc":{"enabled":true,"defaultMinFreeSpace":"not-a-size"}}}
+{"features":{"containerd-snapshotter":true},"builder":{"gc":{"enabled":true,"defaultMinFreeSpace":"not-a-size"}}}
 JSON
 "$SMOLVM_BIN" machine start --name "$NORMAL_MACHINE"
 NORMAL_RUNNING=1
@@ -386,7 +409,7 @@ done
 stop_machine "$NORMAL_MACHINE"
 NORMAL_RUNNING=0
 cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
-{"features":{"containerd-snapshotter":false},"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
+{"features":{"containerd-snapshotter":true},"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
 JSON
 "$SMOLVM_BIN" machine start --name "$NORMAL_MACHINE"
 NORMAL_RUNNING=1
@@ -423,7 +446,7 @@ wait_for_host_docker "$EMBEDDED_DOCKER_SOCKET"
     test -z "$(docker image ls -q "$BUILDKIT_IMAGE_ID")"
     test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
 '
-compose_for "$EMBEDDED_DOCKER_SOCKET" up -d --wait
+start_fixture "$EMBEDDED_DOCKER_SOCKET"
 EMBEDDED_COMPOSE=1
 
 printf '5/5 Verifying embedded Compose paths\n'

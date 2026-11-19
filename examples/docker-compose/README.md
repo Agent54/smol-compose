@@ -20,6 +20,12 @@ Neither script is part of the VM startup entrypoint.
 The packed artifact is accompanied by `.smolmachine.builder.lock`, recording
 its checksum and embedded versions.
 
+Docker uses the containerd image store (`containerd-snapshotter=true`). This
+DinD distribution starts Docker-managed containerd, which keeps its contents
+and overlayfs snapshots under `/storage/docker/containerd/daemon`. That path
+is on the VM's persistent ext4 disk, outside its layered root filesystem.
+There is no separate containerd service or extra startup mount.
+
 For a dependency-free macOS application integration that embeds the released
 runtime and runs Compose inside the VM, see
 [`SWIFT_EMBEDDING.md`](SWIFT_EMBEDDING.md).
@@ -27,7 +33,7 @@ runtime and runs Compose inside the VM, see
 The previous Apple Silicon integration prerelease is
 [`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1).
 It predates the embedded BuildKit image and cannot be used by consumers that
-require `embedded-buildkit-1` metadata. Build this revision through the
+require `containerd-buildkit-1` metadata. Build this revision through the
 verification pipeline below until a matching component release is published.
 
 It validates all of the paths needed by a local Compose backend:
@@ -59,6 +65,20 @@ disk, log, staging file, artifact, and socket below the ignored
 unique machines it created after a successful run. Set `KEEP_STATE=1` to keep
 the machines and packed artifact for inspection. Set `SMOLVM=/path/to/smolvm`
 to test a distribution binary instead of `target/release/smolvm`.
+
+For a local rebuild, set `SMOLVM_BUILD_BASE_ARTIFACT` to a previous pristine
+artifact produced by this image recipe, with its `.builder.lock` alongside it.
+The build verifies its checksum and Docker version, reuses its base layers,
+and reapplies the current recipe before packing. This avoids downloading Docker
+again. It is a build input, not a migration path for a running user's VM.
+
+`SMOLVM_VERIFY_IMAGE_ARCHIVE` can supply a locally saved Docker archive containing
+the Compose fixture images. Verification loads it into each test VM and disables
+pulling, so repeated tests do not redownload the Python fixture.
+
+The builder lock records both the verified BuildKit configuration digest and
+the manifest identity produced when Docker's containerd store imports the
+bundled archive. Builder selection uses the manifest identity.
 
 On macOS CI checkouts whose absolute path would exceed the Unix-socket limit,
 the script temporarily addresses that same `.state` directory through a short,
@@ -154,12 +174,18 @@ Leave that process running.
 
 ## 2. Create and start the machine
 
-In terminal 2:
+In terminal 2, build and verify the artifact first:
+
+```sh
+EXPORT_PACK=1 ./examples/docker-compose/verify.sh
+```
+
+Then create the machine from that artifact (Apple Silicon path shown):
 
 ```sh
 smolvm machine create \
   --name docker-compose-evaluation \
-  --smolfile examples/docker-compose/docker-compose.smolfile \
+  --from examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine \
   --net-backend virtio-net \
   --port 18080:8080 \
   --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/.state/docker.sock" \
@@ -171,8 +197,8 @@ smolvm machine create \
 smolvm machine start --name docker-compose-evaluation
 ```
 
-The first start pulls the pinned Docker 29.9.3 DinD image; subsequent starts use the persistent
-image layers. The image entrypoint starts `dockerd` with its data root on the
+The packed image already contains Docker and the build tools. The image
+entrypoint starts `dockerd` with its data root on the
 VM's persistent ext4 storage disk. The Smolfile passes an explicit Unix-only
 Docker host, so the DinD entrypoint does not add its unauthenticated TCP
 listener.
