@@ -392,24 +392,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # generic agent-readiness timeout (#1011). Rewrite every such dependent to
     # @loader_path so libkrun always loads the dylibs bundled beside it, then
     # re-sign (install_name_tool invalidates the signature).
-    RELOCATED=0
-    while read -r dep; do
-        leaf="$(basename "$dep")"
-        if [[ ! -f "$DIST_DIR/lib/$leaf" ]]; then
-            echo "Error: libkrun.dylib depends on $dep but $leaf is not bundled in lib/"
-            exit 1
-        fi
-        echo "Relocating libkrun dependency: $dep -> @loader_path/$leaf"
-        install_name_tool -change "$dep" "@loader_path/$leaf" "$DIST_DIR/lib/libkrun.dylib"
-        RELOCATED=1
-    done < <(otool -L "$DIST_DIR/lib/libkrun.dylib" | awk 'NR>1 {print $1}' | grep -E '^(@rpath/|/opt/homebrew|/usr/local)/?' || true)
-    if [[ "$RELOCATED" == "1" ]]; then
-        DYLIB_SIGN_ARGS=(--force --sign "$IDENTITY")
-        if [[ "$IDENTITY" != "-" ]]; then
-            DYLIB_SIGN_ARGS+=(--options runtime)
-        fi
-        codesign "${DYLIB_SIGN_ARGS[@]}" "$DIST_DIR/lib/libkrun.dylib"
-    fi
+    bash "$PROJECT_ROOT/scripts/relocate-libkrun-macos.sh" "$DIST_DIR/lib" "$IDENTITY"
 else
     copy_so_with_symlinks() {
         local lib_prefix="$1"

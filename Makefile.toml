@@ -155,6 +155,7 @@ make -C libkrun BLK=1 NET=1 GPU=1
 if [ "$(uname -s)" = "Darwin" ]; then
   # macOS: the dylib lives in lib/ (alongside libkrunfw.5.dylib).
   cp libkrun/target/release/libkrun.dylib lib/libkrun.dylib
+  bash scripts/relocate-libkrun-macos.sh lib
   # libkrun 2.x records this versioned install name. Keep the on-disk alias
   # beside the unversioned bundle entry so directly linked binaries can start.
   ln -sfn libkrun.dylib lib/libkrun.2.dylib
