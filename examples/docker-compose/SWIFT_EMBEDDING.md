@@ -20,8 +20,9 @@ command strings.
 
 ## Release assets
 
-Pin a release tag and download these three files during the application build
-or release process:
+Select the [latest release](https://github.com/Agent54/smol-compose/releases/latest),
+record its tag in the application's build configuration, and download these
+files during the application build or release process:
 
 - `smolvm-<version>-darwin-arm64.tar.gz`
 - `smolvm-<version>-docker-compose-darwin-arm64.smolmachine`
@@ -31,19 +32,10 @@ Verify both artifacts against `checksums.sha256`. The normal distribution and
 the Compose sidecar must come from the same release. Do not download `latest`
 when the application starts.
 
-The current complete, immutable integration prerelease is
-[`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1).
-It contains all three files above. Its expected artifact digests are:
-
-```text
-93dccc758df880a707f53fcb62ca393fea7538f07361280fb0dcc4c12323b714  smolvm-1.13.0-darwin-arm64.tar.gz
-acaa84066ca78f07d47a7e1358e12e90ac6f5b54b6c3344b5bd98d343e26b9bc  smolvm-1.13.0-docker-compose-darwin-arm64.smolmachine
-```
-
-This is a manually produced integration prerelease, not a production `v*`
-release. Pin its exact tag and hashes for integration work. The earlier
-`compose-integration-1.13.0-1706c07` prerelease contains only the sidecar and
-must not be used as the complete app-bundle input.
+For embedded build support, also obtain the matching
+`.smolmachine.builder.lock` and check its metadata against the application's
+requirements. See the [release asset guidance](README.md#release-asset-boundary).
+The release's checksum file supplies the artifact digests.
 
 After verifying the versioned sidecar, copy it into the application bundle as
 `docker-compose.smolmachine`. All paths and Swift examples below use that stable
@@ -265,17 +257,15 @@ Also make this an installation compatibility check:
 smolvm-bin machine exec --name mymanager-docker -- docker compose version
 ```
 
-The packed Docker image contains the Compose v2 CLI plugin, so the Swift app
+The packed Docker image contains the Compose CLI plugin, so the Swift app
 does not need a host `docker` or `docker-compose` executable.
-The published integration sidecar was checked directly and reports Docker
-Compose v2.40.3.
 
 ## Minimal Swift integration sequence
 
 The Swift-app agent can implement the first working integration in this order:
 
-1. During the app build, download the exact three release files above and
-   verify both payloads with the pinned SHA-256 values.
+1. During the app build, download the matching release files above and
+   verify the payloads against that release's `checksums.sha256`.
 2. Extract the runtime archive into `Contents/Helpers/SmolRuntime`, preserve its
    entire layout, and copy the sidecar there as `docker-compose.smolmachine`.
 3. At runtime, create the private application state directories and implement

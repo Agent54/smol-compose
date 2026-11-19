@@ -1,6 +1,11 @@
 # Validation record
 
-## Current rebased release validation
+This is a historical validation record for the release identified below.
+For current downloads, use the
+[latest release](https://github.com/Agent54/smol-compose/releases/latest).
+Consult its release notes and workflow results for validation of those artifacts.
+
+## Historical rebased release validation
 
 The maintained example was validated on Apple Silicon macOS after rebasing the
 Compose work onto SmolVM 1.13.0. Runtime code is commit `c3a9fcc`; the release

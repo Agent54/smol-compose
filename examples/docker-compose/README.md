@@ -6,8 +6,9 @@ guest-to-host Docker socket bridge. The image entrypoint starts `dockerd`
 automatically whenever the VM starts.
 
 The ARM64 runtime is assembled by `prepare-runtime.sh` from the digest-pinned
-Docker 29.9.3 DinD image. Before packing, it installs Buildx 0.39.0 and the
-digest-pinned BuildKit 0.35.0 archive in the guest filesystem. No guest engine
+Docker DinD image selected by [`docker-compose.smolfile`](docker-compose.smolfile).
+Before packing, it installs Buildx and the digest-pinned BuildKit archive from
+[`builder/ContainerTools.lock`](builder/ContainerTools.lock) in the guest filesystem. No guest engine
 executables need to be supplied or mounted by a consuming Mac app.
 
 The guest `/usr/local/share/xe-builder/prepare-builder.sh` is called only when
@@ -32,11 +33,11 @@ For a dependency-free macOS application integration that embeds the released
 runtime and runs Compose inside the VM, see
 [`SWIFT_EMBEDDING.md`](SWIFT_EMBEDDING.md).
 
-The previous Apple Silicon integration prerelease is
-[`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1).
-It predates the embedded BuildKit image and cannot be used by consumers that
-require `containerd-buildkit-2` metadata. Build this revision through the
-verification pipeline below until a matching component release is published.
+Find packaged artifacts on the
+[latest release](https://github.com/Agent54/smol-compose/releases/latest).
+Consumers requiring `containerd-buildkit-2` metadata must select a release with
+a matching `.smolmachine.builder.lock`. If the published assets lack the
+required metadata, build this revision through the verification pipeline below.
 
 It validates all of the paths needed by a local Compose backend:
 
