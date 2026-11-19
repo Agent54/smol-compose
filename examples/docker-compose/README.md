@@ -5,15 +5,30 @@ workload and drives it from host `docker-compose` through SmolVM's
 guest-to-host Docker socket bridge. The image entrypoint starts `dockerd`
 automatically whenever the VM starts.
 
+The ARM64 runtime is assembled by `prepare-runtime.sh` from the digest-pinned
+Docker 29.9.3 DinD image. Before packing, it installs Buildx 0.39.0 and the
+digest-pinned BuildKit 0.35.0 archive in the guest filesystem. No guest engine
+executables need to be supplied or mounted by a consuming Mac app.
+
+The guest `/usr/local/share/xe-builder/prepare-builder.sh` is called only when
+a build is requested. It imports the image and bootstraps the `xe` builder under
+a lock before handing the build to Buildx. Its restart
+policy is `no`, so restarting Docker or the VM does not restart BuildKit.
+`cache.sh` performs maintenance only while the builder is already running.
+Neither script is part of the VM startup entrypoint.
+
+The packed artifact is accompanied by `.smolmachine.builder.lock`, recording
+its checksum and embedded versions.
+
 For a dependency-free macOS application integration that embeds the released
 runtime and runs Compose inside the VM, see
 [`SWIFT_EMBEDDING.md`](SWIFT_EMBEDDING.md).
 
-The current complete Apple Silicon integration prerelease is
+The previous Apple Silicon integration prerelease is
 [`compose-integration-1.13.0-1706c07.1`](https://github.com/Agent54/smol-compose/releases/tag/compose-integration-1.13.0-1706c07.1).
-It contains the matching SmolVM 1.13.0 Darwin ARM64 distribution, the verified
-Docker Compose `.smolmachine`, and checksums for both. The older prerelease
-without the `.1` suffix is sidecar-only and is not a complete embedding input.
+It predates the embedded BuildKit image and cannot be used by consumers that
+require `embedded-buildkit-1` metadata. Build this revision through the
+verification pipeline below until a matching component release is published.
 
 It validates all of the paths needed by a local Compose backend:
 
@@ -62,7 +77,7 @@ sidecar that passed the embedded-artifact test.
 
 - a current SmolVM build whose libkrun includes block and virtio-net support;
 - `docker` and `docker-compose` host clients;
-- `socat`, `curl`, and Python 3 on the host.
+- `socat`, `curl`, Crane, and Python 3 on the host.
 
 The host does not need a Docker daemon. Both Docker Engine and the containers
 run inside the VM.
@@ -106,7 +121,7 @@ Homebrew `bin` directory. Keep any Homebrew `bin` entries out of `.path` if the
 service must not be able to invoke `brew`. Do not run macOS `svc.sh` with sudo.
 
 Provision `docker`, `docker-compose` (or the Docker Compose plugin), `socat`,
-`curl`, and Python 3 the same way: their executable directories must be in
+`curl`, `crane`, and Python 3 the same way: their executable directories must be in
 `.path`, and the service must be restarted after changes. The integration job
 also needs e2fsprogs for `mkfs.ext4`; SmolVM searches the standard installation
 paths, or you can expose its `sbin` directory through `.path`. The release job
@@ -156,7 +171,7 @@ smolvm machine create \
 smolvm machine start --name docker-compose-evaluation
 ```
 
-The first start pulls `docker:28-dind`; subsequent starts use the persistent
+The first start pulls the pinned Docker 29.9.3 DinD image; subsequent starts use the persistent
 image layers. The image entrypoint starts `dockerd` with its data root on the
 VM's persistent ext4 storage disk. The Smolfile passes an explicit Unix-only
 Docker host, so the DinD entrypoint does not add its unauthenticated TCP
@@ -249,24 +264,23 @@ daemon is ready.
 
 ## Build an embedded release artifact
 
-Bundle the Docker image, image metadata, VM runtime, agent rootfs, and disk
-template into a portable release artifact:
+The repository verification pipeline assembles the guest builder, packs the
+runtime, tests restart and socket behavior, and exports the verified artifact:
 
 ```sh
-smolvm pack create \
-  --smolfile examples/docker-compose/docker-compose.smolfile \
-  --output examples/docker-compose/.state/docker-compose-runtime
+EXPORT_PACK=1 ./examples/docker-compose/verify.sh
 ```
 
 The result includes
-`examples/docker-compose/.state/docker-compose-runtime.smolmachine`. An
+`examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine`
+and its `.builder.lock` metadata. An
 embedded distribution can ship that sidecar and create a ready-to-start
 machine without pulling the Docker image:
 
 ```sh
 smolvm machine create \
   --name docker-compose-evaluation \
-  --from examples/docker-compose/.state/docker-compose-runtime.smolmachine \
+  --from examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine \
   --net-backend virtio-net \
   --port 18080:8080 \
   --expose-socket "/var/run/docker.sock:$PWD/examples/docker-compose/.state/docker.sock" \
@@ -283,19 +297,20 @@ into the portable artifact.
 
 A tagged fork release publishes a platform-qualified Docker Compose
 `.smolmachine` alongside the normal SmolVM distribution. It does **not**
-publish or require a custom Docker OCI image: the official `docker:28-dind`
-image and its startup metadata are already embedded in the sidecar.
+publish or require a custom Docker OCI image: the pinned Docker DinD image,
+guest Buildx client, BuildKit archive, and startup metadata are embedded in
+the sidecar.
 
 An embedding application needs both release assets:
 
 - the normal platform distribution, which contains the signed `smolvm` host
   executable, bundled `libkrun`/`libkrunfw`, agent rootfs, and disk templates;
-- the matching Docker Compose `.smolmachine`, which contains the Docker guest
-  image layers and workload configuration.
+- the matching Docker Compose `.smolmachine` and `.smolmachine.builder.lock`,
+  which contain the guest image, build tools, configuration, and version metadata.
 
 For a macOS Apple Silicon Swift app, download the tagged `darwin-arm64`
 distribution and `smolvm-<version>-docker-compose-darwin-arm64.smolmachine`,
-verify both against `checksums.sha256`, and copy them into the app bundle. No
+verify all assets against `checksums.sha256`, and copy them into the app bundle. No
 Docker daemon, Docker.framework, Rust toolchain, or image build dependency is
 needed in the Swift app. The app only needs a small wrapper around the bundled
 runtime (for example an XPC service or `Process`) and chooses its socket and

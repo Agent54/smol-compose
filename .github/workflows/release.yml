@@ -541,7 +541,7 @@ jobs:
       - name: Check host clients and image tools
         run: |
           missing=()
-          for tool in docker socat curl python3; do
+          for tool in docker socat curl python3 crane; do
             command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
           done
           if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
@@ -595,11 +595,14 @@ jobs:
           cp \
             examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine \
             "examples/docker-compose/.state/smolvm-${version}-docker-compose-darwin-arm64.smolmachine"
+          cp \
+            examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine.builder.lock \
+            "examples/docker-compose/.state/smolvm-${version}-docker-compose-darwin-arm64.smolmachine.builder.lock"
 
       - uses: actions/upload-artifact@v7
         with:
           name: dist-compose-runtime
-          path: examples/docker-compose/.state/smolvm-*-docker-compose-darwin-arm64.smolmachine
+          path: examples/docker-compose/.state/smolvm-*-docker-compose-darwin-arm64.smolmachine*
           if-no-files-found: error
           include-hidden-files: true
 
@@ -607,7 +610,9 @@ jobs:
         if: always()
         run: |
           rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine
+          rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine.builder.lock
           rm -f -- examples/docker-compose/.state/smolvm-*-docker-compose-darwin-arm64.smolmachine
+          rm -f -- examples/docker-compose/.state/smolvm-*-docker-compose-darwin-arm64.smolmachine.builder.lock
           rm -rf -- examples/docker-compose/.state/release-dist-${{ github.run_id }}.download
           rm -rf -- examples/docker-compose/.state/release-dist-${{ github.run_id }}.dir
 
@@ -697,7 +702,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip *.smolmachine > checksums.sha256
+          sha256sum *.tar.gz *.zip *.smolmachine *.builder.lock > checksums.sha256
           cat checksums.sha256
 
       - name: Create GitHub Release
@@ -723,6 +728,7 @@ jobs:
             dist/*.tar.gz \
             dist/*.zip \
             dist/*.smolmachine \
+            dist/*.builder.lock \
             dist/checksums.sha256
 
       # Ping the Homebrew tap to bump its formula to this release immediately,

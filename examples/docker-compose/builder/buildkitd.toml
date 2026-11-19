@@ -1,0 +1,4 @@
+# Cache collection is performed explicitly by the launcher while builds are idle.
+[worker.oci]
+  gc = false
+  max-parallelism = 2

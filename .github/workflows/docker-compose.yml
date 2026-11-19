@@ -135,7 +135,7 @@ jobs:
       - name: Check host clients and image tools
         run: |
           missing=()
-          for tool in docker socat curl python3; do
+          for tool in docker socat curl python3 crane; do
             command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
           done
           if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
@@ -175,12 +175,13 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: docker-compose-runtime-darwin-arm64
-          path: examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine
+          path: examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine*
           if-no-files-found: error
 
       - name: Remove workflow-owned state
         if: always()
         run: |
           rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine
+          rm -f -- examples/docker-compose/.state/docker-compose-runtime-darwin-arm64.smolmachine.builder.lock
           rm -rf -- examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.download
           rm -rf -- examples/docker-compose/.state/ci-rootfs-${{ github.run_id }}.dir

@@ -4,7 +4,7 @@
 # starts dockerd automatically when the machine starts, including after a VM
 # restart and when this image is bundled into a .smolmachine release artifact.
 
-image = "docker:28-dind"
+image = "docker:29.9.3-dind@sha256:ad3c03cf98cb790e69b7aedd29d0406646945f2b2bc01910efddecda0db5d24d"
 entrypoint = ["/usr/local/bin/dockerd-entrypoint.sh"]
 cmd = [
     # Supplying `dockerd` explicitly prevents the DinD entrypoint from adding
@@ -15,7 +15,7 @@ cmd = [
     "--data-root=/storage/docker",
     "--storage-driver=overlay2",
 ]
-env = ["DOCKER_TLS_CERTDIR="]
+env = ["DOCKER_TLS_CERTDIR=", "DOCKER_BUILDKIT=1", "DOCKER_CONFIG=/storage/xe-build-client"]
 
 cpus = 2
 memory = 2048

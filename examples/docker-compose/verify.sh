@@ -6,6 +6,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 STATE_DIR="$SCRIPT_DIR/.state"
 SMOLVM_BIN="${SMOLVM:-$REPO_ROOT/target/release/smolvm}"
 SMOLFILE="$SCRIPT_DIR/docker-compose.smolfile"
+source "$SCRIPT_DIR/builder/ContainerTools.lock"
 COMPOSE_FILE="$SCRIPT_DIR/compose.yaml"
 RUN_ID="$(date +%s)-$$"
 SOCKET_ID="$$"
@@ -118,6 +119,7 @@ cleanup() {
         rm -f -- "$STATE_DIR/verify-ev-${SOCKET_ID}.sock"
         rm -f -- "$STATE_DIR/verify-pack-${SOCKET_ID}.bin"
         rm -f -- "$STATE_DIR/verify-pack-${SOCKET_ID}.bin.smolmachine"
+        rm -f -- "$STATE_DIR/verify-pack-${SOCKET_ID}.bin.smolmachine.builder.lock"
         rm -f -- "$STATE_DIR/verify-embedded-start-${SOCKET_ID}.log"
         rm -rf -- "$STATE_DIR/verify-pack-${SOCKET_ID}.staging"
         rm -rf -- "$DAEMON_CONFIG_DIR"
@@ -203,7 +205,7 @@ verify_paths() {
     printf '  ok: private workload /run and individual host socket mount\n'
 
     python3 "$SCRIPT_DIR/fixtures/file_upload_probe.py" "$SMOLVM_BIN" "$machine" "$STATE_DIR" \
-        --image docker:28-dind
+        --image "$(sed -n 's/^image = "\(.*\)"/\1/p' "$SMOLFILE")"
 
     port_result="$(curl --fail --silent --show-error "http://127.0.0.1:$port")"
     host_to_vm_result="$(compose_for "$docker_socket" exec -T app python -c \
@@ -218,6 +220,7 @@ verify_paths() {
 mkdir -p "$STATE_DIR"
 
 require_command docker
+require_command "${CRANE:-crane}"
 require_command socat
 require_command curl
 require_command python3
@@ -305,13 +308,14 @@ done
 
 mkdir -p "$DAEMON_CONFIG_DIR"
 cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
-{"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
+{"features":{"containerd-snapshotter":false},"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
 JSON
 
 printf '1/5 Creating normal Compose machine %s\n' "$NORMAL_MACHINE"
+SMOLVM="$SMOLVM_BIN" bash "$SCRIPT_DIR/prepare-runtime.sh" "$PACK_OUTPUT"
 "$SMOLVM_BIN" machine create \
     --name "$NORMAL_MACHINE" \
-    --smolfile "$SMOLFILE" \
+    --from "$PACK_OUTPUT.smolmachine" \
     --volume "$DAEMON_CONFIG_DIR:/etc/docker:ro" \
     --net-backend virtio-net \
     --port "$NORMAL_PORT:8080" \
@@ -324,11 +328,27 @@ NORMAL_CREATED=1
 NORMAL_RUNNING=1
 wait_for_guest_docker "$NORMAL_MACHINE"
 wait_for_host_docker "$DOCKER_SOCKET"
+"$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" -- sh -ec '
+    . /usr/local/share/xe-builder/ContainerTools.lock
+    test -z "$(docker image ls -q "$BUILDKIT_IMAGE_ID")"
+    test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
+    /usr/local/share/xe-builder/cache.sh prune --builder xe --force
+    test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
+'
 compose_for "$DOCKER_SOCKET" up -d --wait
 NORMAL_COMPOSE=1
 NORMAL_DATA_DIR="$("$SMOLVM_BIN" machine data-dir --name "$NORMAL_MACHINE")"
 grep -Fq 'Starting up' "$NORMAL_DATA_DIR/agent-console.log" || fail "Docker startup output was discarded"
 verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT" "$NORMAL_MACHINE"
+"$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" --timeout 180s -- \
+    /usr/local/share/xe-builder/prepare-builder.sh "$DOCKER_VERSION" "$BUILDKIT_IMAGE_ID"
+"$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" --timeout 180s -- sh -ec '
+    mkdir -p /workspace/xe-build-probe
+    printf "FROM scratch\nCOPY --link payload /payload\n" > /workspace/xe-build-probe/Dockerfile
+    printf buildkit-probe > /workspace/xe-build-probe/payload
+    docker buildx build --builder xe --load -t xe-build-probe /workspace/xe-build-probe
+    test "$(docker inspect --format "{{.HostConfig.RestartPolicy.Name}}" buildx_buildkit_xe0)" = no
+'
 
 printf '2/5 Restarting normal machine and rechecking persistence\n'
 stop_machine "$NORMAL_MACHINE"
@@ -337,6 +357,11 @@ NORMAL_RUNNING=0
 NORMAL_RUNNING=1
 wait_for_guest_docker "$NORMAL_MACHINE"
 wait_for_host_docker "$DOCKER_SOCKET"
+"$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" -- sh -ec '
+    test "$(docker inspect --format "{{.State.Running}}" buildx_buildkit_xe0)" = false
+    /usr/local/share/xe-builder/cache.sh prune --builder xe --force
+    test "$(docker inspect --format "{{.State.Running}}" buildx_buildkit_xe0)" = false
+'
 wait_for_http "$NORMAL_PORT"
 verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT" "$NORMAL_MACHINE"
 stop_machine "$NORMAL_MACHINE"
@@ -345,7 +370,7 @@ NORMAL_RUNNING=0
 # A valid JSON configuration can fail later during BuildKit initialization.
 # The actual daemon error must reach the retained console, even after it exits.
 cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
-{"builder":{"gc":{"enabled":true,"defaultMinFreeSpace":"not-a-size"}}}
+{"features":{"containerd-snapshotter":false},"builder":{"gc":{"enabled":true,"defaultMinFreeSpace":"not-a-size"}}}
 JSON
 "$SMOLVM_BIN" machine start --name "$NORMAL_MACHINE"
 NORMAL_RUNNING=1
@@ -361,7 +386,7 @@ done
 stop_machine "$NORMAL_MACHINE"
 NORMAL_RUNNING=0
 cat >"$DAEMON_CONFIG_DIR/daemon.json" <<'JSON'
-{"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
+{"features":{"containerd-snapshotter":false},"builder":{"gc":{"enabled":true,"defaultReservedSpace":"0B","defaultMaxUsedSpace":"5GB","defaultMinFreeSpace":"1073741824"}}}
 JSON
 "$SMOLVM_BIN" machine start --name "$NORMAL_MACHINE"
 NORMAL_RUNNING=1
@@ -371,11 +396,7 @@ wait_for_http "$NORMAL_PORT"
 stop_machine "$NORMAL_MACHINE"
 NORMAL_RUNNING=0
 
-printf '3/5 Building embedded Docker runtime\n'
-"$SMOLVM_BIN" pack create \
-    --smolfile "$SMOLFILE" \
-    --output "$PACK_OUTPUT" \
-    --staging-dir "$PACK_STAGING"
+printf '3/5 Checking embedded Docker runtime\n'
 [[ -x "$PACK_OUTPUT" ]] || fail "packed launcher was not created"
 [[ -f "$PACK_OUTPUT.smolmachine" ]] || fail "packed .smolmachine was not created"
 
@@ -391,12 +412,17 @@ printf '4/5 Starting fresh machine from embedded artifact\n'
 EMBEDDED_CREATED=1
 
 "$SMOLVM_BIN" machine start --name "$EMBEDDED_MACHINE" 2>&1 | tee "$EMBEDDED_START_LOG"
-if grep -Fq 'Pulling docker:28-dind' "$EMBEDDED_START_LOG"; then
-    fail "artifact-backed machine unexpectedly pulled docker:28-dind"
+if grep -Fq 'Pulling docker:' "$EMBEDDED_START_LOG"; then
+    fail "artifact-backed machine unexpectedly pulled its Docker base image"
 fi
 EMBEDDED_RUNNING=1
 wait_for_guest_docker "$EMBEDDED_MACHINE"
 wait_for_host_docker "$EMBEDDED_DOCKER_SOCKET"
+"$SMOLVM_BIN" machine exec --name "$EMBEDDED_MACHINE" -- sh -ec '
+    . /usr/local/share/xe-builder/ContainerTools.lock
+    test -z "$(docker image ls -q "$BUILDKIT_IMAGE_ID")"
+    test -z "$(docker container ls -aq --filter name=^/buildx_buildkit_xe0$)"
+'
 compose_for "$EMBEDDED_DOCKER_SOCKET" up -d --wait
 EMBEDDED_COMPOSE=1
 
@@ -405,6 +431,7 @@ verify_paths "$EMBEDDED_DOCKER_SOCKET" "$EMBEDDED_VM_SOCKET" "$EMBEDDED_PORT" "$
 
 if [[ "$EXPORT_PACK" == 1 ]]; then
     cp -- "$PACK_OUTPUT.smolmachine" "$EXPORTED_PACK"
+    cp -- "$PACK_OUTPUT.smolmachine.builder.lock" "$EXPORTED_PACK.builder.lock"
 fi
 
 SUCCESS=1
