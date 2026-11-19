@@ -28,7 +28,7 @@ jobs:
     name: Secrets invariants
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Check secrets guardrails
         run: ./scripts/check-secrets-guards.sh
 
@@ -38,7 +38,7 @@ jobs:
     steps:
       # LFS on: check-krun-exports.sh reads the actual bundled lib binaries.
       # (check-libkrun-provenance.sh itself only needs the pinned gitlinks.)
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           lfs: true
       - name: Bundled libkrun matches the pinned submodule
@@ -63,7 +63,7 @@ jobs:
     # .cargo/audit.toml, which ignores documented unmaintained-transitive notices
     # so a real vulnerability stands out instead of hiding in warning noise.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
@@ -73,7 +73,7 @@ jobs:
   # ==========================================================================
   macos:
     name: macOS (arm64)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
 
@@ -433,7 +433,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
