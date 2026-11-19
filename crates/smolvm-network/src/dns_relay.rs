@@ -494,4 +494,47 @@ mod tests {
         assert_eq!(resp, b"answer-bytes");
         server.join().unwrap();
     }
+
+    #[test]
+    fn forwarding_preserves_negative_replies_and_large_compressed_answers() {
+        use std::net::TcpListener;
+        let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x0fvery-long-owner\x07example\0\0\x01\0\x01");
+        let mut nodata = query.clone();
+        nodata[2..4].copy_from_slice(&[0x81, 0x80]);
+        let mut nxdomain = nodata.clone();
+        nxdomain[3] |= 3;
+        let mut large = nodata.clone();
+        large[6..8].copy_from_slice(&200u16.to_be_bytes());
+        for _ in 0..200 {
+            // Repeated compressed owner names keep this below 4 KiB; expanding
+            // them would exceed the old adapter's response assembly limit.
+            large.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 192, 0, 2, 1]);
+        }
+        assert!(large.len() < DNS_MAX_MSG);
+        assert_eq!(crate::dns::answer_ip_records(&large).len(), 200);
+        for response in [nodata, nxdomain, large] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected_query = query.clone();
+            let reply = response.clone();
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut length = [0u8; 2];
+                socket.read_exact(&mut length).unwrap();
+                let mut received = vec![0u8; usize::from(u16::from_be_bytes(length))];
+                socket.read_exact(&mut received).unwrap();
+                assert_eq!(received, expected_query);
+                socket
+                    .write_all(&(reply.len() as u16).to_be_bytes())
+                    .unwrap();
+                socket.write_all(&reply).unwrap();
+            });
+            assert_eq!(forward_dns_query_tcp(address, &query).unwrap(), response);
+            server.join().unwrap();
+        }
+    }
 }

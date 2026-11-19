@@ -487,6 +487,18 @@ pub fn launch_agent_vm_dynamic(
 
             let mut guest_network = GuestNetworkConfig::default();
             guest_network.host_service = crate::network::launch::guest_host_service()?;
+            #[cfg(target_os = "macos")]
+            {
+                guest_network.upstream_dns =
+                    match crate::data::network::forwarded_dns(config.resources.dns) {
+                        Ok(server) => server,
+                        Err(error) => free_ctx_on_err!(format!("DNS configuration: {error}")),
+                    };
+            }
+            #[cfg(not(target_os = "macos"))]
+            if let Some(dns) = config.resources.dns {
+                guest_network.upstream_dns = dns;
+            }
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings

@@ -2186,6 +2186,33 @@ impl RunCmd {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn update_dns_options_are_explicit_and_mutually_exclusive() {
+        use clap::Parser;
+        let cli =
+            TestMachineCli::parse_from(["machine", "update", "--name", "dns", "--dns", "1.1.1.1"]);
+        let MachineCmd::Update(cmd) = cli.command else {
+            panic!("expected update");
+        };
+        assert_eq!(cmd.dns, Some("1.1.1.1".parse().unwrap()));
+        assert!(!cmd.system_dns);
+        let cli =
+            TestMachineCli::parse_from(["machine", "update", "--name", "dns", "--system-dns"]);
+        let MachineCmd::Update(cmd) = cli.command else {
+            panic!("expected update");
+        };
+        assert!(cmd.system_dns);
+        for args in [
+            vec!["--dns", "1.1.1.1", "--system-dns"],
+            vec!["--dns", "1.1.1.1", "--no-net"],
+            vec!["--dns", "not-an-ip"],
+        ] {
+            let mut command = vec!["machine", "update", "--name", "dns"];
+            command.extend(args);
+            assert!(TestMachineCli::try_parse_from(command).is_err());
+        }
+    }
+
+    #[test]
     fn bake_start_forwards_proxy_when_set() {
         // No proxy: plain start.
         assert_eq!(
@@ -4845,6 +4872,14 @@ pub struct UpdateCmd {
     #[arg(long, conflicts_with = "net")]
     pub no_net: bool,
 
+    /// Set a custom DNS resolver for the next start (implies --net).
+    #[arg(long, value_name = "IP", conflicts_with_all = ["system_dns", "no_net"])]
+    pub dns: Option<std::net::Ipv4Addr>,
+
+    /// Clear custom DNS (virtio-net reads system DNS on the next start).
+    #[arg(long, conflicts_with = "dns")]
+    pub system_dns: bool,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -5076,6 +5111,15 @@ impl UpdateCmd {
             }
 
             // Network
+            if let Some(dns) = self.dns {
+                changes.push(format!("  DNS: {dns}"));
+                r.dns = Some(dns);
+                r.network = true;
+            } else if self.system_dns {
+                changes
+                    .push("  DNS: backend default (virtio-net: system DNS at startup)".to_string());
+                r.dns = None;
+            }
             if self.net {
                 changes.push("  network: enabled".to_string());
                 r.network = true;

@@ -42,6 +42,40 @@ pub fn default_dns_addr() -> IpAddr {
     host_dns()
 }
 
+/// Select the virtio gateway's upstream once per VM start. Queries originate
+/// on the host, so local DNS servers such as WireGuard's 127.* addresses work.
+/// A missing system IPv4 resolver is an error, never a public-DNS substitution.
+#[cfg(target_os = "macos")]
+pub fn forwarded_dns(custom: Option<Ipv4Addr>) -> std::io::Result<Ipv4Addr> {
+    forwarded_dns_from_resolv(std::path::Path::new("/etc/resolv.conf"), custom)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn forwarded_dns_from_resolv(
+    path: &std::path::Path,
+    custom: Option<Ipv4Addr>,
+) -> std::io::Result<Ipv4Addr> {
+    if let Some(server) = custom {
+        return Ok(server);
+    }
+    let contents = std::fs::read_to_string(path)?;
+    for line in contents.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("nameserver") {
+            if let Some(server) = words
+                .next()
+                .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            {
+                return Ok(server);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "System DNS has no configured IPv4 nameserver; configure one or use --dns <IPv4>",
+    ))
+}
+
 /// TCP port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
@@ -286,6 +320,53 @@ impl PortMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarded_dns_accepts_loopback_and_refreshes_on_each_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resolv.conf");
+        std::fs::write(
+            &path,
+            "# DNS configuration\n nameserver 127.0.2.2 # tunnel\nnameserver 127.0.2.3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, None).unwrap(),
+            Ipv4Addr::new(127, 0, 2, 2)
+        );
+        std::fs::write(&path, "nameserver 192.168.1.1\n").unwrap();
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, None).unwrap(),
+            Ipv4Addr::new(192, 168, 1, 1)
+        );
+    }
+
+    #[test]
+    fn forwarded_dns_never_substitutes_a_public_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resolv.conf");
+        let custom = Ipv4Addr::new(10, 20, 30, 40);
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, Some(custom)).unwrap(),
+            custom
+        );
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, None).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        for contents in [
+            "",
+            "nameserver ::1\n",
+            "nameserver invalid\n",
+            "nameserver-prefix 1.1.1.1\n",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(
+                forwarded_dns_from_resolv(&path, None).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     #[test]
     fn test_cidrs_contain_ip() {

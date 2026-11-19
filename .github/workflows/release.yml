@@ -730,6 +730,17 @@ jobs:
             dist/*.builder.lock \
             dist/checksums.sha256
 
+      - name: Trigger Xe Launcher component updates
+        if: github.repository == 'Agent54/smol-compose' && steps.release_tag.outputs.is_compose == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.XE_LAUNCHER_TOKEN }}
+        run: |
+          gh api \
+            --method POST \
+            repos/Agent54/xe-computer-launcher/actions/workflows/component-updates.yml/dispatches \
+            --raw-field ref=int \
+            --raw-field 'inputs[component]=all'
+
       # Ping the Homebrew tap to bump its formula to this release immediately,
       # instead of waiting for its scheduled poll. Best-effort: if the token
       # secret isn't configured, this no-ops (the tap's cron picks the release up

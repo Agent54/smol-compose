@@ -47,6 +47,19 @@ See `VirtioNetworkRuntime` and its configuration types for embedding. A working
 integration must supply the compatible VM-side frame transport and manage the
 runtime lifecycle; adding this dependency alone does not enable networking.
 
+On macOS, SmolVM reads the first IPv4 nameserver in the host's `/etc/resolv.conf` when
+the VM starts. Host loopback resolvers are supported because DNS forwarding
+runs on the host. An explicit `--dns <IPv4>` uses that address instead. Both
+modes use the existing UDP/TCP forwarding path and preserve upstream response
+bytes. System mode fails if no IPv4 server is configured; it does not substitute
+a public resolver. Restart the VM after connecting or disconnecting a VPN to
+refresh the snapshot. There is no VPN detection or live resolver bridge.
+Existing machines retain their data; the guest and Docker query the gateway.
+Use `machine update --name NAME --dns 1.1.1.1` on a stopped machine to set a
+custom resolver, or `--system-dns` to clear it. Other platforms retain their
+existing DNS defaults. This change does not alter TSI DNS behavior or implement
+domain-specific macOS resolver routing.
+
 ## Scope and security
 
 This backend is distinct from smolvm's TSI networking path. Availability depends

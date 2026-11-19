@@ -1182,9 +1182,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 let mut guest_network = GuestNetworkConfig::default();
                 guest_network.host_service = crate::network::launch::guest_host_service()
                     .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
-                // A custom resolver (--dns) becomes the gateway's upstream: the
-                // guest still points at the gateway (100.96.0.1), which forwards
-                // queries to this address instead of the default.
+                // On macOS, snapshot System DNS or use the custom server. The
+                // guest and Docker keep querying the gateway at 100.96.0.1.
+                #[cfg(target_os = "macos")]
+                {
+                    guest_network.upstream_dns =
+                        match crate::data::network::forwarded_dns(resources.dns) {
+                            Ok(server) => server,
+                            Err(error) => {
+                                krun_free_ctx(ctx);
+                                return Err(Error::config("DNS", error.to_string()));
+                            }
+                        };
+                }
+                #[cfg(not(target_os = "macos"))]
                 if let Some(dns) = resources.dns {
                     guest_network.upstream_dns = dns;
                 }

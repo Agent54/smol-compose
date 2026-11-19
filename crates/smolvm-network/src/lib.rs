@@ -93,7 +93,8 @@ use stack::{start_network_stack, VirtioPollConfig};
 use tcp_listeners::create_tcp_channel;
 use tcp_listeners::TcpPortListeners;
 
-/// Default upstream DNS resolver used by the gateway runtime.
+/// Default upstream for callers embedding the gateway without a DNS setting.
+/// SmolVM sets its selected system/custom server explicitly before starting it.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
 /// Host->guest published TCP port mapping serviced by the virtio gateway.
@@ -150,9 +151,10 @@ pub struct GuestNetworkConfig {
     pub dns_server: Ipv4Addr,
     /// Upstream resolver the gateway forwards guest DNS queries to.
     ///
-    /// Defaults to [`DEFAULT_DNS_ADDR`]; the launcher overrides it when the
-    /// caller passes `--dns <ip>` so a VM on a network that blocks the default
-    /// resolver can still resolve names.
+    /// SmolVM supplies `--dns <ip>` when set. On macOS it otherwise reads the
+    /// first configured host IPv4 nameserver when the VM starts. Other platforms
+    /// retain the default upstream. Loopback servers are reachable because the
+    /// gateway forwards queries from the host.
     pub upstream_dns: Ipv4Addr,
     /// Optional dedicated host service reachable only through the gateway IP.
     pub host_service: Option<GatewayHostService>,
@@ -353,10 +355,11 @@ pub fn start_virtio_network(
     fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
-        "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
+        "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={} upstream_dns={}",
         guest_network.guest_ip,
         guest_network.gateway_ip,
-        guest_network.dns_server
+        guest_network.dns_server,
+        guest_network.upstream_dns
     );
     let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
     let fabric = match fabric_lease {
