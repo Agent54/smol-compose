@@ -15,17 +15,39 @@ mkdir -p "$DOCKER_CONFIG"
 # Serialize image import and builder registration across concurrent builds.
 exec 9>"$DOCKER_CONFIG/prepare.lock"
 flock -x 9
-image="xe-buildkit:$BUILDKIT_VERSION"
-if ! /usr/local/bin/docker image inspect "$image" >/dev/null 2>&1; then
+identity="$DOCKER_CONFIG/buildkit-${BUILDKIT_IMAGE##*@}.id"
+image_id=
+if [ -f "$identity" ]; then image_id="$(cat "$identity")"; fi
+if [ -z "$image_id" ] || ! /usr/local/bin/docker image inspect "$image_id" >/dev/null 2>&1; then
     # The pinned, single-image archive is untagged. Let Docker assign its ID;
     # never reconstruct the importer manifest or assume a particular store.
     loaded="$(/usr/local/bin/docker load --input "$tools/buildkit.tar")"
     printf '%s\n' "$loaded" >&2
     image_id="$(printf '%s\n' "$loaded" | sed -n 's/^Loaded image ID: //p')"
     [ -n "$image_id" ] || { echo 'Docker did not return the loaded BuildKit image ID' >&2; exit 1; }
-    /usr/local/bin/docker image tag "$image_id" "$image"
+    /usr/local/bin/docker image inspect "$image_id" >/dev/null
+    printf '%s\n' "$image_id" > "$identity.tmp"
+    mv "$identity.tmp" "$identity"
 fi
-image_id="$(/usr/local/bin/docker image inspect --format '{{.Id}}' "$image")"
+builder=buildx_buildkit_xe0
+# Buildx's docker-container driver always pulls when it creates a container,
+# even for an already-loaded image ID. Create from the bundled image explicitly
+# with pulls forbidden; Buildx then owns startup, readiness and build transport.
+existing="$(/usr/local/bin/docker container ls --all --quiet --filter "name=^/$builder$")"
+if [ -z "$existing" ]; then
+    set --
+    if [ "$(/usr/local/bin/docker info --format '{{.CgroupDriver}}')" = cgroupfs ]; then
+        set -- --cgroup-parent /docker/buildx
+    fi
+    /usr/local/bin/docker container create --pull=never --name "$builder" \
+        --privileged --init --restart=no "$@" \
+        --mount "type=volume,source=${builder}_state,target=/var/lib/buildkit" \
+        --mount "type=bind,source=$tools/buildkitd.toml,target=/etc/buildkit/buildkitd.toml,readonly" \
+        "$image_id" --config /etc/buildkit/buildkitd.toml --allow-insecure-entitlement network.host >&2
+fi
+[ "$(/usr/local/bin/docker container inspect --format '{{.Image}}' "$builder")" = "$image_id" ] || {
+    echo 'The existing BuildKit container does not use the bundled image' >&2; exit 1;
+}
 set --
 if [ -f "$DOCKER_CONFIG/buildx/instances/xe" ]; then set -- --append; fi
 /usr/local/libexec/docker/cli-plugins/docker-buildx create --name xe --node xe0 "$@" \

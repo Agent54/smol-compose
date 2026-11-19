@@ -246,6 +246,7 @@ require_command socat
 require_command curl
 require_command deno
 require_command seq
+bash "$REPO_ROOT/tests/test_compose_runtime_inputs.sh"
 
 if command -v docker-compose >/dev/null 2>&1; then
     COMPOSE=(docker-compose)
@@ -371,6 +372,22 @@ verify_paths "$DOCKER_SOCKET" "$VM_SOCKET" "$NORMAL_PORT" "$NORMAL_MACHINE"
     docker buildx build --builder xe --load -t xe-build-probe /workspace/xe-build-probe
     test "$(docker inspect --format "{{.HostConfig.RestartPolicy.Name}}" buildx_buildkit_xe0)" = no
 '
+"$SMOLVM_BIN" machine exec --name "$NORMAL_MACHINE" --timeout 180s -- sh -ec '
+    . /usr/local/share/xe-builder/ContainerTools.lock
+    expected="$(docker inspect --format "{{.Image}}" buildx_buildkit_xe0)"
+    docker tag xe-build-probe "xe-buildkit:$BUILDKIT_VERSION"
+    docker rm -f buildx_buildkit_xe0
+    actual="$(/usr/local/share/xe-builder/prepare-builder.sh "$DOCKER_VERSION" "$BUILDKIT_IMAGE")"
+    test "$actual" = "$expected"
+    test "$(docker inspect --format "{{.Image}}" buildx_buildkit_xe0)" = "$expected"
+    docker rm -f buildx_buildkit_xe0
+    docker image rm "$expected"
+    actual="$(/usr/local/share/xe-builder/prepare-builder.sh "$DOCKER_VERSION" "$BUILDKIT_IMAGE")"
+    test "$actual" = "$expected"
+    test "$(docker inspect --format "{{.Image}}" buildx_buildkit_xe0)" = "$expected"
+    docker image rm "xe-buildkit:$BUILDKIT_VERSION"
+'
+printf '  ok: conflicting image tags cannot select the builder; pruned bundled images reload locally\n'
 
 printf '2/5 Restarting normal machine and rechecking persistence\n'
 stop_machine "$NORMAL_MACHINE"

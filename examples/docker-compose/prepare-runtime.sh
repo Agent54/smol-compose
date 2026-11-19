@@ -8,6 +8,7 @@ smolvm="${SMOLVM:?Set SMOLVM to the runtime executable}"
 crane="${CRANE:-crane}"
 output="${1:?usage: prepare-runtime.sh OUTPUT_EXECUTABLE}"
 state="$script_dir/.state/builder-assets"
+buildkit_archive="$state/buildkit-${BUILDKIT_IMAGE##*@}.tar"
 mkdir -p "$state" "$(dirname "$output")"
 case "$(uname -m)" in arm64|aarch64) ;; *) echo 'This image definition targets ARM64' >&2; exit 1 ;; esac
 if [[ ! -f "$state/buildx-v$BUILDX_VERSION" ]]; then
@@ -17,12 +18,12 @@ if [[ ! -f "$state/buildx-v$BUILDX_VERSION" ]]; then
     mv "$state/buildx-v$BUILDX_VERSION.download" "$state/buildx-v$BUILDX_VERSION"
 fi
 [[ "$(shasum -a 256 "$state/buildx-v$BUILDX_VERSION" | awk '{print $1}')" = "$BUILDX_LINUX_ARM64_SHA256" ]]
-if [[ ! -f "$state/buildkit-v$BUILDKIT_VERSION.tar" ]]; then
-    "$crane" pull --platform linux/arm64 --format tarball "$BUILDKIT_IMAGE" "$state/buildkit-v$BUILDKIT_VERSION.tar.download"
-    "$crane" validate --tarball "$state/buildkit-v$BUILDKIT_VERSION.tar.download"
-    mv "$state/buildkit-v$BUILDKIT_VERSION.tar.download" "$state/buildkit-v$BUILDKIT_VERSION.tar"
+if [[ ! -f "$buildkit_archive" ]]; then
+    "$crane" pull --platform linux/arm64 --format tarball "$BUILDKIT_IMAGE" "$buildkit_archive.download"
+    "$crane" validate --tarball "$buildkit_archive.download"
+    mv "$buildkit_archive.download" "$buildkit_archive"
 fi
-"$crane" validate --tarball "$state/buildkit-v$BUILDKIT_VERSION.tar"
+"$crane" validate --tarball "$buildkit_archive"
 cp "$script_dir/builder/ContainerTools.lock" "$script_dir/builder/prepare-builder.sh" \
     "$script_dir/builder/cache.sh" "$script_dir/builder/buildkitd.toml" "$script_dir/builder/daemon.json" "$state/"
 # An explicit pristine build artifact avoids downloading its base layers again.
@@ -36,6 +37,10 @@ if [[ -n "${SMOLVM_BUILD_BASE_ARTIFACT:-}" ]]; then
     expected="$(sed -n 's/^SMOLVM_COMPOSE_SHA256=//p' "$base.builder.lock")"
     [[ "$expected" =~ ^[0-9a-f]{64}$ && "$(shasum -a 256 "$base" | awk '{print $1}')" = "$expected" ]]
     [[ "$(sed -n 's/^DOCKER_VERSION=//p' "$base.builder.lock")" = "$DOCKER_VERSION" ]]
+    [[ "$(sed -n 's/^DOCKER_IMAGE=//p' "$base.builder.lock")" = "$base_image" ]] || {
+        echo 'Build base does not match the pinned Docker image; rebuild without SMOLVM_BUILD_BASE_ARTIFACT.' >&2
+        exit 1
+    }
     source_args=(--from "$base")
 fi
 machine="compose-image-build-$$"
@@ -55,7 +60,7 @@ created=1
     mkdir -p /usr/local/share/xe-builder /usr/local/libexec/docker/cli-plugins /etc/docker
     cp /opt/image-build/daemon.json /etc/docker/daemon.json
     cp /opt/image-build/ContainerTools.lock /opt/image-build/prepare-builder.sh /opt/image-build/cache.sh /opt/image-build/buildkitd.toml /usr/local/share/xe-builder/
-    cp "/opt/image-build/buildkit-v$BUILDKIT_VERSION.tar" /usr/local/share/xe-builder/buildkit.tar
+    cp "/opt/image-build/buildkit-${BUILDKIT_IMAGE##*@}.tar" /usr/local/share/xe-builder/buildkit.tar
     cp "/opt/image-build/buildx-v$BUILDX_VERSION" /usr/local/libexec/docker/cli-plugins/docker-buildx
     chmod 755 /usr/local/share/xe-builder/*.sh /usr/local/libexec/docker/cli-plugins/docker-buildx
     /usr/local/libexec/docker/cli-plugins/docker-buildx version
@@ -66,6 +71,7 @@ created=0
     --output "$output" --staging-dir "$state/pack"
 {
     cat "$state/ContainerTools.lock"
+    printf 'DOCKER_IMAGE=%s\n' "$base_image"
     printf 'SMOLVM_RUNTIME_FORMAT=containerd-buildkit-2\n'
     printf 'SMOLVM_COMPOSE_SHA256=%s\n' "$(shasum -a 256 "$output.smolmachine" | awk '{print $1}')"
     printf 'SMOLVM_COMPOSE_SOURCE_REVISION=%s\n' "$(git -C "$script_dir" describe --always --dirty)"

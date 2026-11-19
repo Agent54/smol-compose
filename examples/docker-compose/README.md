@@ -11,8 +11,10 @@ digest-pinned BuildKit 0.35.0 archive in the guest filesystem. No guest engine
 executables need to be supplied or mounted by a consuming Mac app.
 
 The guest `/usr/local/share/xe-builder/prepare-builder.sh` is called only when
-a build is requested. It imports the image and bootstraps the `xe` builder under
-a lock before handing the build to Buildx. Its restart
+a build is requested. It imports the image and creates the builder container
+with Docker's `--pull=never`, then lets Buildx start it under the same lock.
+Buildx would otherwise attempt a registry pull even for a loaded image ID.
+A missing bundled image fails instead of downloading a replacement. Its restart
 policy is `no`, so restarting Docker or the VM does not restart BuildKit.
 `cache.sh` performs maintenance only while the builder is already running.
 Neither script is part of the VM startup entrypoint.
@@ -68,7 +70,7 @@ to test a distribution binary instead of `target/release/smolvm`.
 
 For a local rebuild, set `SMOLVM_BUILD_BASE_ARTIFACT` to a previous pristine
 artifact produced by this image recipe, with its `.builder.lock` alongside it.
-The build verifies its checksum and Docker version, reuses its base layers,
+The build verifies its checksum, Docker version and exact Docker image reference, reuses its base layers,
 and reapplies the current recipe before packing. This avoids downloading Docker
 again. It is a build input, not a migration path for a running user's VM.
 
@@ -76,9 +78,12 @@ again. It is a build input, not a migration path for a running user's VM.
 the Compose fixture images. Verification loads it into each test VM and disables
 pulling, so repeated tests do not redownload the Python fixture.
 
-The builder lock pins the BuildKit registry reference. Crane validates the
-bundled archive; on the first build, Docker loads it and supplies the image ID
-used by Buildx. No host code calculates Docker's internal image identity.
+The builder lock pins the BuildKit registry reference. Archives are cached by
+that digest and validated by Crane. On the first build, Docker loads the archive
+and supplies the image ID used by Buildx. The guest saves that ID under the pinned
+digest and asks Docker whether it still exists before reuse. If it was pruned,
+Docker reloads the bundled archive. Mutable image tags are never used to select
+the builder. No host code calculates Docker's internal image identity.
 
 On macOS CI checkouts whose absolute path would exceed the Unix-socket limit,
 the script temporarily addresses that same `.state` directory through a short,
