@@ -19,13 +19,16 @@ identity="$DOCKER_CONFIG/buildkit-${BUILDKIT_IMAGE##*@}.id"
 image_id=
 if [ -f "$identity" ]; then image_id="$(cat "$identity")"; fi
 if [ -z "$image_id" ] || ! /usr/local/bin/docker image inspect "$image_id" >/dev/null 2>&1; then
-    # The pinned, single-image archive is untagged. Let Docker assign its ID;
-    # never reconstruct the importer manifest or assume a particular store.
+    # Docker reports a tag for tagged archives and an ID for untagged archives.
+    # Resolve that single loaded reference through Docker to obtain its ID.
     loaded="$(/usr/local/bin/docker load --input "$tools/buildkit.tar")"
     printf '%s\n' "$loaded" >&2
-    image_id="$(printf '%s\n' "$loaded" | sed -n 's/^Loaded image ID: //p')"
-    [ -n "$image_id" ] || { echo 'Docker did not return the loaded BuildKit image ID' >&2; exit 1; }
-    /usr/local/bin/docker image inspect "$image_id" >/dev/null
+    loaded_ref="$(printf '%s\n' "$loaded" | sed -n -e 's/^Loaded image ID: //p' -e 's/^Loaded image: //p')"
+    [ "$(printf '%s\n' "$loaded_ref" | wc -l)" -eq 1 ] && [ -n "$loaded_ref" ] || {
+        echo 'Docker did not return exactly one loaded BuildKit image reference' >&2; exit 1;
+    }
+    image_id="$(/usr/local/bin/docker image inspect --format '{{.Id}}' "$loaded_ref")"
+    [ -n "$image_id" ] || { echo 'Docker returned an empty BuildKit image ID' >&2; exit 1; }
     printf '%s\n' "$image_id" > "$identity.tmp"
     mv "$identity.tmp" "$identity"
 fi

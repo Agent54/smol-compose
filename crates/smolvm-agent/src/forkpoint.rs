@@ -569,6 +569,7 @@ mod tests {
     use super::*;
     use crate::oci::{OciSpec, ProcessIdentity};
 
+    #[track_caller]
     fn wait_for_marker(path: &Path) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !path.is_file() && std::time::Instant::now() < deadline {
@@ -803,7 +804,9 @@ mod tests {
         let generation = marker_generation(&ready);
         assert!(!armed.exists());
 
-        std::fs::write(&arm, format!("{ARM_PREFIX}{generation}\n")).unwrap();
+        let arm_temp = state.join("arm.tmp");
+        std::fs::write(&arm_temp, format!("{ARM_PREFIX}{generation}\n")).unwrap();
+        std::fs::rename(&arm_temp, &arm).unwrap();
         wait_for_marker(&armed);
         assert!(marker_matches(&armed, ARMED_PREFIX, &generation));
         std::fs::remove_file(&arm).unwrap();
@@ -814,7 +817,8 @@ mod tests {
         assert!(!armed.exists());
         assert!(!helper.is_finished());
 
-        std::fs::write(&arm, format!("{ARM_PREFIX}{generation}\n")).unwrap();
+        std::fs::write(&arm_temp, format!("{ARM_PREFIX}{generation}\n")).unwrap();
+        std::fs::rename(&arm_temp, &arm).unwrap();
         wait_for_marker(&armed);
         std::fs::write(&restored, b"restored\n").unwrap();
         std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
