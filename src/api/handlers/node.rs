@@ -6,7 +6,7 @@ use axum::{extract::State, Json};
 use std::sync::Arc;
 
 use crate::api::state::ApiState;
-use crate::api::types::CapacityResponse;
+use crate::api::types::{CapacityResponse, CudaDeviceCapacity};
 
 /// Id minted once per serve process (pid + startup nanos — unique across a restart,
 /// dependency-free). Constant for the process lifetime; a change tells the control
@@ -53,15 +53,36 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
     }
 
     let (allocated_cpus, allocated_memory_mb) = state.allocated_resources();
-    let (used_cpus, used_memory_mb, used_disk_gb) = state.real_utilization();
+    let utilization = state.real_utilization();
+    let host_memory = crate::process::host_memory_stats();
+    let cuda_devices = state.cuda_devices().map(|devices| {
+        devices
+            .into_iter()
+            .map(|device| CudaDeviceCapacity {
+                ordinal: device.device_ordinal,
+                uuid: device.uuid,
+                name: device.name,
+                utilization_percent: device.utilization_percent,
+                memory_used_mib: device.used_memory_mib,
+                memory_free_mib: device.free_memory_mib,
+                memory_total_mib: device.total_memory_mib,
+            })
+            .collect()
+    });
 
     Json(CapacityResponse {
         allocated_cpus,
         allocated_memory_mb,
-        used_cpus,
-        used_memory_mb,
-        used_disk_gb,
+        used_cpus: utilization.used_cpus,
+        used_memory_mb: utilization.rss_mb,
+        used_memory_pss_mb: utilization.pss_mb,
+        used_memory_private_mb: utilization.private_memory_mb,
+        used_memory_shared_mapped_mb: utilization.shared_memory_mapped_mb,
+        host_memory_total_mb: host_memory.map(|memory| memory.total_bytes / (1024 * 1024)),
+        host_memory_available_mb: host_memory.map(|memory| memory.available_bytes / (1024 * 1024)),
+        used_disk_gb: utilization.disk_gb,
         boot_id: boot_id().to_string(),
+        cuda_devices,
     })
     .into_response()
 }
@@ -90,6 +111,32 @@ mod tests {
         assert_eq!(cap["used_cpus"], 0.0);
         assert_eq!(cap["used_memory_mb"], 0);
         assert_eq!(cap["used_disk_gb"], 0);
+        assert!(cap.get("cuda_devices").is_none());
+    }
+
+    #[tokio::test]
+    async fn capacity_reports_fresh_cuda_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let state = Arc::new(ApiState::with_db(db));
+        state.record_cuda_devices(Some(vec![crate::api::admission::GpuDeviceSample {
+            device_ordinal: 0,
+            uuid: "GPU-test".into(),
+            name: "NVIDIA H100 80GB HBM3".into(),
+            utilization_percent: 42.0,
+            used_memory_mib: 12_345,
+            free_memory_mib: 67_655,
+            total_memory_mib: 80_000,
+        }]));
+
+        let resp = capacity(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let cap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cap["cuda_devices"][0]["ordinal"], 0);
+        assert_eq!(cap["cuda_devices"][0]["uuid"], "GPU-test");
+        assert_eq!(cap["cuda_devices"][0]["name"], "NVIDIA H100 80GB HBM3");
+        assert_eq!(cap["cuda_devices"][0]["memoryTotalMib"], 80_000);
     }
 
     #[tokio::test]

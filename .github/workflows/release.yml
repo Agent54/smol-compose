@@ -3,15 +3,35 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A manual release is only for the Compose branch. Normal v* tag pushes keep
+  # the upstream release path unchanged.
+  validate-release:
+    name: Validate release trigger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the Compose branch for manual releases
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "$GITHUB_REF" != 'refs/heads/compose' ]]; then
+            echo "error: manually dispatched Compose releases must run from the compose branch" >&2
+            exit 1
+          fi
+
   # ==========================================================================
   # Run CI checks first
   # ==========================================================================
   ci:
+    needs: validate-release
     uses: ./.github/workflows/ci.yml
 
   # ==========================================================================
@@ -185,6 +205,11 @@ jobs:
 
       - name: Build rootfs
         run: |
+          # patchelf: fetch-vulkan-guest-driver.sh gives the bundled Venus
+          # driver and its closure RUNPATH=$ORIGIN so nothing in the bundle
+          # has to be exposed to workloads through LD_LIBRARY_PATH.
+          sudo apt-get update
+          sudo apt-get install -y patchelf
           chmod +x /tmp/agent/smolvm-agent /tmp/cuda/smolvm-cuda-run
           AGENT_BINARY=/tmp/agent/smolvm-agent \
           CUDA_GUEST_BINARY=/tmp/cuda/smolvm-cuda-run \
@@ -239,7 +264,7 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             rootfs_arch: aarch64
             agent_arch: aarch64
             lib_dir: lib
@@ -500,16 +525,168 @@ jobs:
           path: dist/smolvm-*-windows-x86_64.zip
 
   # ==========================================================================
+  # Verify and package the optional Docker Compose guest (Apple Silicon)
+  # ==========================================================================
+  build-compose-runtime:
+    name: Verify Docker Compose release asset (darwin-arm64)
+    needs: build-dist
+    runs-on: [self-hosted, macOS, ARM64, raw]
+    timeout-minutes: 45
+    concurrency:
+      group: docker-compose-hypervisor
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check host clients and image tools
+        run: |
+          missing=()
+          for tool in docker socat curl deno crane; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+            missing+=("docker-compose or the Docker Compose plugin")
+          fi
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing runner service tools: ${missing[*]} (PATH=$PATH)."
+            echo "Install these tools manually and add their directories to actions-runner/.path, then restart with ./svc.sh stop and ./svc.sh start." >&2
+            echo "See examples/docker-compose/README.md#self-hosted-macos-runner-setup." >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-darwin-arm64
+          path: examples/docker-compose/state/release-dist-${{ github.run_id }}.download
+
+      - name: Extract the exact distribution being released
+        id: dist
+        run: |
+          archive=(examples/docker-compose/state/release-dist-${{ github.run_id }}.download/smolvm-*-darwin-arm64.tar.gz)
+          if [[ "${#archive[@]}" != 1 || ! -f "${archive[0]}" ]]; then
+            echo "error: expected exactly one darwin-arm64 distribution archive" >&2
+            exit 1
+          fi
+          mkdir -p examples/docker-compose/state/release-dist-${{ github.run_id }}.dir
+          tar -xzf "${archive[0]}" -C examples/docker-compose/state/release-dist-${{ github.run_id }}.dir
+          runtime=(examples/docker-compose/state/release-dist-${{ github.run_id }}.dir/smolvm-*-darwin-arm64)
+          if [[ "${#runtime[@]}" != 1 || ! -x "${runtime[0]}/smolvm" ]]; then
+            echo "error: extracted darwin-arm64 runtime was not found" >&2
+            exit 1
+          fi
+          echo "root=${runtime[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Run Compose verification against the release distribution
+        run: ./examples/docker-compose/verify.sh
+        env:
+          EXPORT_PACK: '1'
+          SMOLVM: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/smolvm
+          SMOLVM_AGENT_ROOTFS: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/agent-rootfs
+          SMOLVM_LIB_DIR: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/lib
+          LIBKRUN_BUNDLE: ${{ github.workspace }}/${{ steps.dist.outputs.root }}/lib
+
+      - name: Name the verified release asset
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ -z "$version" ]]; then
+            echo "error: could not read package version" >&2
+            exit 1
+          fi
+          cp \
+            examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine \
+            "examples/docker-compose/state/smolvm-${version}-docker-compose-darwin-arm64.smolmachine"
+          cp \
+            examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine.builder.lock \
+            "examples/docker-compose/state/smolvm-${version}-docker-compose-darwin-arm64.smolmachine.builder.lock"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-compose-runtime
+          path: examples/docker-compose/state/smolvm-*-docker-compose-darwin-arm64.smolmachine*
+          if-no-files-found: error
+
+      - name: Remove workflow-owned state
+        if: always()
+        run: |
+          rm -f -- examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine
+          rm -f -- examples/docker-compose/state/docker-compose-runtime-darwin-arm64.smolmachine.builder.lock
+          rm -f -- examples/docker-compose/state/smolvm-*-docker-compose-darwin-arm64.smolmachine
+          rm -f -- examples/docker-compose/state/smolvm-*-docker-compose-darwin-arm64.smolmachine.builder.lock
+          rm -rf -- examples/docker-compose/state/release-dist-${{ github.run_id }}.download
+          rm -rf -- examples/docker-compose/state/release-dist-${{ github.run_id }}.dir
+
+  # ==========================================================================
   # Create GitHub Release
   # ==========================================================================
   release:
     name: Create Release
-    needs: [build-dist, build-dist-windows]
+    needs: [build-dist, build-dist-windows, build-compose-runtime]
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release_tag.outputs.tag }}
+      is_compose: ${{ steps.release_tag.outputs.is_compose }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release_tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            git fetch --force origin '+refs/tags/*:refs/tags/*'
+
+            version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+            if [[ -z "$version" ]]; then
+              echo "error: could not read the mainline package version from Cargo.toml" >&2
+              exit 1
+            fi
+            base_tag="v$version"
+            if ! git ls-remote --exit-code --tags \
+              https://github.com/smol-machines/smolvm.git \
+              "refs/tags/$base_tag" >/dev/null; then
+              echo "error: mainline tag does not exist upstream: $base_tag" >&2
+              exit 1
+            fi
+
+            max_counter=0
+            while IFS= read -r candidate; do
+              counter="${candidate#"${base_tag}-compose_"}"
+              if [[ "$counter" =~ ^[0-9]+$ ]]; then
+                counter_value=$((10#$counter))
+                if (( counter_value > max_counter )); then
+                  max_counter=$counter_value
+                fi
+              fi
+            done < <(git tag --list "${base_tag}-compose_*")
+
+            tag="${base_tag}-compose_$((max_counter + 1))"
+            if git show-ref --verify --quiet "refs/tags/$tag"; then
+              echo "error: computed release tag already exists: $tag" >&2
+              exit 1
+            fi
+
+            is_compose=true
+          else
+            tag="$PUSH_TAG"
+            case "$tag" in
+              v*) ;;
+              *) echo "error: release tag must start with v: $tag" >&2; exit 1 ;;
+            esac
+            case "$tag" in
+              *-compose_*) is_compose=true ;;
+              *) is_compose=false ;;
+            esac
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "is_compose=$is_compose" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag"
 
       - name: Download all dist artifacts
         uses: actions/download-artifact@v8
@@ -524,19 +701,45 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip > checksums.sha256
+          sha256sum *.tar.gz *.zip *.smolmachine *.builder.lock > checksums.sha256
           cat checksums.sha256
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+          IS_COMPOSE: ${{ steps.release_tag.outputs.is_compose }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "smolvm ${{ github.ref_name }}" \
+          release_flags=()
+          if [[ "$IS_COMPOSE" == 'true' ]]; then
+            release_flags+=(--prerelease)
+          fi
+          tag_flags=(--verify-tag)
+          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            tag_flags=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$RELEASE_TAG" \
+            "${tag_flags[@]}" \
+            --title "smolvm $RELEASE_TAG" \
             --generate-notes \
+            "${release_flags[@]}" \
             dist/*.tar.gz \
             dist/*.zip \
+            dist/*.smolmachine \
+            dist/*.builder.lock \
             dist/checksums.sha256
+
+      - name: Trigger Xe Launcher component updates
+        if: github.repository == 'Agent54/smol-compose' && steps.release_tag.outputs.is_compose == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.XE_LAUNCHER_TOKEN }}
+        run: |
+          gh api \
+            --method POST \
+            repos/Agent54/xe-computer-launcher/actions/workflows/component-updates.yml/dispatches \
+            --raw-field ref=int \
+            --raw-field 'inputs[component]=all'
 
       # Ping the Homebrew tap to bump its formula to this release immediately,
       # instead of waiting for its scheduled poll. Best-effort: if the token
@@ -544,9 +747,10 @@ jobs:
       # within a few hours anyway) and never fails the release. The token is a
       # fine-grained PAT with Contents:write on smol-machines/homebrew-tap.
       - name: Notify Homebrew tap of the new release
+        if: steps.release_tag.outputs.is_compose != 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "HOMEBREW_TAP_DISPATCH_TOKEN not set — skipping instant bump (the tap polls on a schedule)."
@@ -564,6 +768,7 @@ jobs:
   publish-package-repositories:
     name: Publish package repositories
     needs: release
+    if: needs.release.outputs.is_compose != 'true'
     permissions:
       actions: read
       contents: read
@@ -571,7 +776,7 @@ jobs:
       id-token: write
     uses: ./.github/workflows/pacman-repo.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.release.outputs.tag }}
 
   # Bump the Nix flake (nix/smolvm.nix) to this release and open a PR. Same
   # reasoning as the steps above (the `release: published` event never fires for
@@ -579,9 +784,10 @@ jobs:
   update-nix-flake:
     name: Update Nix flake
     needs: release
+    if: needs.release.outputs.is_compose != 'true'
     permissions:
       contents: write
       pull-requests: write
     uses: ./.github/workflows/update-nix-flake.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.release.outputs.tag }}

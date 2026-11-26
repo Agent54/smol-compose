@@ -63,10 +63,14 @@
 
 pub mod agent;
 pub mod api;
+/// Reference-safe lifecycle management for Linux shared pack and COW caches.
+#[cfg(target_os = "linux")]
+pub mod artifact_cache;
 pub mod config;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
 // so the module (and its callers in cuda_host) are unix-only.
+pub mod checkpoint_store;
 #[cfg(unix)]
 pub mod cuda_daemon;
 pub mod cuda_host;
@@ -76,20 +80,31 @@ pub mod db;
 pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
+pub mod docker_config;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
 pub mod image_store;
+/// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
+/// Lives in the library, not the CLI, so any binary that links the engine (the
+/// containerd shim) can serve `_boot-vm` from its own executable instead of
+/// needing a separate `_boot-vm`-capable helper on disk.
+pub mod internal_boot;
 pub mod log_rotation;
 pub mod network;
 /// Shared from-VM pack export used by every `pack create --from-vm` front-end.
 pub mod pack_export;
 pub mod platform;
 pub mod pool;
+/// Portable live-checkpoint compatibility and one-shot restore support.
+pub mod portable_checkpoint;
 pub mod process;
 pub mod registry;
+pub mod remote_volume;
 pub mod secrets;
 pub mod settings;
 pub mod smolfile;
+/// Guest-local staged mount synchronization.
+pub mod staged_mount;
 pub mod storage;
 pub mod systemd_scope;
 pub mod util;

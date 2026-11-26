@@ -14,7 +14,8 @@ use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
-use smolvm::data::network::PortMapping;
+use smolvm::data::network::{PortMapping, PortMappingSpec};
+use smolvm::data::resources::BlockIoEngine;
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::platform::Platform;
@@ -148,9 +149,11 @@ fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMo
         .enumerate()
         .map(|(i, m)| PackedMount {
             tag: HostMount::mount_tag(i),
+            runtime_tag: m.runtime_mount_tag(i),
             host_path: m.source.to_string_lossy().to_string(),
             guest_path: m.target.to_string_lossy().to_string(),
             read_only: m.read_only,
+            staged: m.staged,
         })
         .collect()
 }
@@ -199,6 +202,11 @@ pub struct PackRunCmd {
     #[arg(short = 'w', long, value_name = "DIR", help_heading = "Container")]
     pub workdir: Option<String>,
 
+    /// Run as this user (name or `uid[:gid]`); defaults to the user the
+    /// machine was packed with, then the image's USER.
+    #[arg(short = 'u', long, value_name = "USER", help_heading = "Container")]
+    pub user: Option<String>,
+
     /// Set environment variable (can be used multiple times)
     #[arg(
         short = 'e',
@@ -217,15 +225,19 @@ pub struct PackRunCmd {
     )]
     pub volume: Vec<String>,
 
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    #[arg(long, help_heading = "Container")]
+    pub allow_system_mounts: bool,
+
     /// Expose port from container to host (can be used multiple times)
     #[arg(
         short = 'p',
         long = "port",
-        value_parser = PortMapping::parse,
+        value_parser = PortMappingSpec::parse,
         value_name = "HOST:GUEST",
         help_heading = "Network"
     )]
-    pub port: Vec<PortMapping>,
+    pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
     #[arg(long, help_heading = "Network")]
@@ -250,6 +262,11 @@ pub struct PackRunCmd {
     /// Overlay disk size in GiB (for persistent rootfs changes)
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub overlay: Option<u64>,
+
+    /// Block I/O engine. `sync` preserves the default single-request path;
+    /// `async` uses restricted io_uring for raw disks on Linux.
+    #[arg(long = "block-io", value_enum, help_heading = "Resources")]
+    pub block_io: Option<BlockIoEngine>,
 
     /// Re-extract assets even if already cached
     #[arg(long)]
@@ -461,8 +478,14 @@ impl PackRunCmd {
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
-            .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        extract::create_or_copy_storage_disk(
+            &cache_dir,
+            template,
+            &storage_path,
+            manifest.assets.storage_logical_size,
+            storage_gib,
+        )
+        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
         let overlay_runtime_path = setup_vm_overlay(
             &manifest,
@@ -472,8 +495,10 @@ impl PackRunCmd {
         )?;
 
         // 8. Parse CLI args
-        let mounts = HostMount::parse(&self.volume)?;
-        let port_mappings = PortMapping::to_tuples(&self.port);
+        let mounts = HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
+        let ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| Error::config("pack run ports", e))?;
+        let port_mappings = PortMapping::to_tuples(&ports);
 
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
@@ -482,15 +507,18 @@ impl PackRunCmd {
                 self.egress.as_ref(),
                 self.net,
                 manifest.network,
-                !self.port.is_empty(),
+                !ports.is_empty(),
             ),
             network_backend: self.net_backend,
             dns: None,
             network_name: None,
             gpu: manifest.gpu,
+            nested_virt: false,
             cuda: cuda_enabled,
             storage_gib,
             overlay_gib: self.overlay,
+            block_io: self.block_io.unwrap_or_default(),
+            disks: Vec::new(),
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: self
@@ -503,7 +531,7 @@ impl PackRunCmd {
             self.egress
                 .as_ref()
                 .and_then(|policy| policy.dns_filter_hosts.as_deref()),
-            self.port.len(),
+            ports.len(),
         )?;
 
         // Build packed mounts for the launcher
@@ -572,6 +600,15 @@ impl PackRunCmd {
                 // steal keystrokes or corrupt terminal state.
                 detach_vm_child_stdio();
 
+                let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+                    config.vsock_socket.to_path_buf(),
+                    config
+                        .mounts
+                        .iter()
+                        .filter(|mount| !mount.staged)
+                        .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+                );
+
                 if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
                     let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
                     let _ = std::fs::write(&config.console_log, &msg);
@@ -609,7 +646,7 @@ impl PackRunCmd {
                     .overlay
                     .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
                 mounts: mounts.clone(),
-                ports: self.port.clone(),
+                ports: ports.clone(),
                 resources: resources.clone(),
                 ssh_agent_socket: None,
                 cuda: false,
@@ -974,6 +1011,36 @@ fn build_command(manifest: &smolvm_pack::PackManifest, cli_command: &[String]) -
     }
 }
 
+/// What a packed machine launches with, after the command line has had its
+/// say over the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackedLaunch {
+    pub command: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub workdir: Option<String>,
+    pub user: Option<String>,
+}
+
+/// The one place a packed manifest and the command line are combined into a
+/// launch. Every packed entry point (`pack run`, the standalone binary's run
+/// and exec) goes through here, so a setting the manifest carries cannot be
+/// honoured by one of them and ignored by another. The command line wins for
+/// each setting it gives; the manifest fills the rest.
+pub(crate) fn resolve_packed_launch(
+    manifest: &smolvm_pack::PackManifest,
+    cli_command: &[String],
+    cli_env: &[String],
+    cli_workdir: Option<String>,
+    cli_user: Option<String>,
+) -> smolvm::Result<PackedLaunch> {
+    Ok(PackedLaunch {
+        command: build_command(manifest, cli_command),
+        env: build_env(manifest, cli_env)?,
+        workdir: cli_workdir.or_else(|| manifest.workdir.clone()),
+        user: cli_user.or_else(|| manifest.user.clone()),
+    })
+}
+
 /// Build environment variables from manifest defaults and CLI overrides.
 fn build_env(
     manifest: &smolvm_pack::PackManifest,
@@ -1031,17 +1098,29 @@ fn execute_command(
     args: &PackRunCmd,
     mounts: &[smolvm::data::storage::HostMount],
 ) -> smolvm::Result<i32> {
-    let command = build_command(manifest, &args.command);
-    let mut env = build_env(manifest, &args.env)?;
+    let PackedLaunch {
+        command,
+        mut env,
+        workdir,
+        user,
+    } = resolve_packed_launch(
+        manifest,
+        &args.command,
+        &args.env,
+        args.workdir.clone(),
+        args.user.clone(),
+    )?;
     if args.auto_graph {
         smolvm::util::enable_cuda_auto_graph_env(&mut env);
     }
-    let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
     let params = ExecParams {
-        command,
-        env,
-        workdir,
+        launch: PackedLaunch {
+            command,
+            env,
+            workdir,
+            user,
+        },
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -1051,9 +1130,7 @@ fn execute_command(
 
 /// Resolved execution parameters for a packed command.
 struct ExecParams {
-    command: Vec<String>,
-    env: Vec<(String, String)>,
-    workdir: Option<String>,
+    launch: PackedLaunch,
     interactive: bool,
     tty: bool,
     timeout: Option<Duration>,
@@ -1069,9 +1146,13 @@ fn execute_packed_command(
     persistent_overlay_id: Option<String>,
 ) -> smolvm::Result<i32> {
     let ExecParams {
-        command,
-        env,
-        workdir,
+        launch:
+            PackedLaunch {
+                command,
+                env,
+                workdir,
+                user,
+            },
         interactive,
         tty,
         timeout,
@@ -1103,6 +1184,7 @@ fn execute_packed_command(
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(timeout)
                     .with_tty(tty)
@@ -1112,6 +1194,7 @@ fn execute_packed_command(
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user)
                     .with_mounts(mount_bindings)
                     .with_timeout(timeout)
                     .with_persistent_overlay(persistent_overlay_id);
@@ -1199,17 +1282,26 @@ struct PackedRunArgs {
     #[arg(short = 'w', long = "workdir", value_name = "PATH")]
     workdir: Option<String>,
 
+    /// Run as this user (name or `uid[:gid]`); defaults to the user the
+    /// machine was packed with, then the image's USER.
+    #[arg(short = 'u', long = "user", value_name = "USER")]
+    user: Option<String>,
+
     /// Set environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
 
-    /// Mount a volume (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Mount a volume (HOST:GUEST[:ro|rw|staged])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     volume: Vec<String>,
 
-    /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    port: Vec<PortMapping>,
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    #[arg(long)]
+    allow_system_mounts: bool,
+
+    /// Expose port from container to host (single port or one-to-one range)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
     #[arg(long)]
@@ -1234,6 +1326,11 @@ struct PackedRunArgs {
     /// Overlay disk size in GiB
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
+
+    /// Block I/O engine. `sync` is the default; `async` adaptively overlaps
+    /// queued raw-disk reads on Linux.
+    #[arg(long = "block-io", value_enum)]
+    block_io: Option<BlockIoEngine>,
 
     /// Enable CUDA-over-vsock (also implied by the packed machine's manifest or
     /// `SMOLVM_CUDA=1`).
@@ -1260,13 +1357,22 @@ struct PackedStartArgs {
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
 
-    /// Mount a volume (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Block I/O engine. `sync` is the default; `async` adaptively overlaps
+    /// queued raw-disk reads on Linux.
+    #[arg(long = "block-io", value_enum)]
+    block_io: Option<BlockIoEngine>,
+
+    /// Mount a volume (HOST:GUEST[:ro|rw|staged])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     volume: Vec<String>,
 
-    /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    port: Vec<PortMapping>,
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    #[arg(long)]
+    allow_system_mounts: bool,
+
+    /// Expose port from container to host (single port or one-to-one range)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
     #[arg(long)]
@@ -1299,6 +1405,11 @@ struct PackedExecArgs {
     /// Working directory inside the container
     #[arg(short = 'w', long = "workdir", value_name = "PATH")]
     workdir: Option<String>,
+
+    /// Run as this user (name or `uid[:gid]`); defaults to the user the
+    /// machine was packed with, then the image's USER.
+    #[arg(short = 'u', long = "user", value_name = "USER")]
+    user: Option<String>,
 
     /// Set environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
@@ -1412,8 +1523,10 @@ fn run_ephemeral(
                 tty: args.tty,
                 timeout: args.timeout,
                 workdir: args.workdir,
+                user: args.user,
                 env: args.env,
                 volume: args.volume,
+                allow_system_mounts: args.allow_system_mounts,
                 port: args.port,
                 net: args.net,
                 net_backend: args.net_backend,
@@ -1421,6 +1534,7 @@ fn run_ephemeral(
                 mem: args.mem,
                 storage: args.storage,
                 overlay: args.overlay,
+                block_io: args.block_io,
                 egress: None,
                 force_extract,
                 info: false,
@@ -1532,8 +1646,14 @@ fn run_from_cache(
         .storage_template
         .as_ref()
         .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, storage_gib)
-        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+    extract::create_or_copy_storage_disk(
+        cache_dir,
+        template,
+        &storage_path,
+        manifest.assets.storage_logical_size,
+        storage_gib,
+    )
+    .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
     let overlay_runtime_path = setup_vm_overlay(
         manifest,
@@ -1542,24 +1662,29 @@ fn run_from_cache(
         args.overlay,
     )?;
 
-    let mounts = HostMount::parse(&args.volume)?;
-    let port_mappings = PortMapping::to_tuples(&args.port);
+    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
+    let ports = PortMappingSpec::expand_all(&args.port)
+        .map_err(|e| Error::config("packed run ports", e))?;
+    let port_mappings = PortMapping::to_tuples(&ports);
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !args.port.is_empty(),
+        network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: None,
         network_name: None,
         gpu: manifest.gpu,
+        nested_virt: false,
         cuda: manifest.cuda,
         storage_gib,
         overlay_gib: args.overlay,
+        block_io: args.block_io.unwrap_or_default(),
+        disks: Vec::new(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
     };
-    validate_requested_network_backend(&resources, None, args.port.len())?;
+    validate_requested_network_backend(&resources, None, ports.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1600,6 +1725,15 @@ fn run_from_cache(
         // steal keystrokes or corrupt terminal state.
         detach_vm_child_stdio();
 
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+            config.vsock_socket.to_path_buf(),
+            config
+                .mounts
+                .iter()
+                .filter(|mount| !mount.staged)
+                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+        );
+
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
             let _ = std::fs::write(&config.console_log, &msg);
@@ -1629,7 +1763,7 @@ fn run_from_cache(
                 .overlay
                 .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
             mounts: mounts.clone(),
-            ports: args.port.clone(),
+            ports: ports.clone(),
             resources: resources.clone(),
             ssh_agent_socket: None,
             cuda: false,
@@ -1711,9 +1845,7 @@ fn run_from_cache(
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
     let params = ExecParams {
-        command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env)?,
-        workdir: args.workdir.or_else(|| manifest.workdir.clone()),
+        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -1933,8 +2065,14 @@ fn daemon_start(
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
-            .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        extract::create_or_copy_storage_disk(
+            &cache_dir,
+            template,
+            &storage_path,
+            manifest.assets.storage_logical_size,
+            storage_gib,
+        )
+        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
     // Create overlay disk (preserves existing disk on restart)
@@ -1949,24 +2087,29 @@ fn daemon_start(
     let vsock_path = daemon.join("agent.sock");
 
     // Parse CLI args
-    let mounts = HostMount::parse(&args.volume)?;
-    let port_mappings = PortMapping::to_tuples(&args.port);
+    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
+    let ports = PortMappingSpec::expand_all(&args.port)
+        .map_err(|e| Error::config("packed start ports", e))?;
+    let port_mappings = PortMapping::to_tuples(&ports);
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !args.port.is_empty(),
+        network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: None,
         network_name: None,
         gpu: manifest.gpu,
+        nested_virt: false,
         cuda: manifest.cuda,
         storage_gib,
         overlay_gib: args.overlay,
+        block_io: args.block_io.unwrap_or_default(),
+        disks: Vec::new(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
     };
-    validate_requested_network_backend(&resources, None, args.port.len())?;
+    validate_requested_network_backend(&resources, None, ports.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -2030,6 +2173,15 @@ fn daemon_start(
         // Without this, libkrun's threads inherit stdin and steal
         // keystrokes from the user's shell.
         detach_vm_child_stdio();
+
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+            config.vsock_socket.to_path_buf(),
+            config
+                .mounts
+                .iter()
+                .filter(|mount| !mount.staged)
+                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+        );
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
@@ -2112,9 +2264,7 @@ fn daemon_exec(
     // Virtiofs devices are fixed at boot — exec cannot add new host mounts.
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
-        command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env)?,
-        workdir: args.workdir.or_else(|| manifest.workdir.clone()),
+        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,

@@ -62,6 +62,9 @@ pub fn start_all() {
     let mut published = Vec::new();
     for sock in decode(&encoded) {
         match sock.direction {
+            // Exposed sockets are dialed in the workload's namespace. Sharing
+            // their parent directories would replace the image's private /run
+            // (or a user volume) with unrelated files from the VM root.
             SocketDirection::Expose => spawn_bridge(sock, serve_expose),
             SocketDirection::Mount => match prepare_mount_listener(&sock) {
                 Ok(listener) => {
@@ -127,6 +130,9 @@ pub fn inject_into_container(spec: &mut crate::oci::OciSpec) {
 
 fn inject_sockets_into_container(spec: &mut crate::oci::OciSpec, sockets: &[PublishedSocket]) {
     for sock in sockets {
+        if sock.direction != SocketDirection::Mount {
+            continue;
+        }
         spec.add_bind_mount(
             &mount_socket_path(sock.vsock_port).to_string_lossy(),
             &sock.guest_path,
@@ -139,8 +145,6 @@ fn inject_sockets_into_container(spec: &mut crate::oci::OciSpec, sockets: &[Publ
 /// socket and relay. Mirrors the Docker bridge but with a caller-supplied path.
 #[cfg(target_os = "linux")]
 fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
-
     let listener = crate::vsock::VsockListener::bind(sock.vsock_port)?;
     tracing::info!(
         vsock_port = sock.vsock_port,
@@ -161,7 +165,7 @@ fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
         let guest_path = sock.guest_path.clone();
         thread::Builder::new()
             .name("expose-sock-fwd".into())
-            .spawn(move || match UnixStream::connect(&guest_path) {
+            .spawn(move || match dial_app(&guest_path) {
                 Ok(app) => {
                     if let Err(e) = relay(host_conn, app) {
                         tracing::debug!(error = %e, "expose-socket relay ended");
@@ -462,7 +466,7 @@ mod mount_tests {
     #[test]
     fn container_injection_overlays_mount_socket_after_user_volume() {
         let mut spec = spec();
-        spec.add_bind_mount("/mnt/virtiofs/shared", "/run/control", false);
+        spec.add_bind_mount("/run/smolvm/virtiofs/shared", "/run/control", false);
         let volume_index = spec.mounts.len() - 1;
 
         inject_sockets_into_container(&mut spec, &[mount_sock(6100, "/run/control/engine.sock")]);
@@ -482,6 +486,51 @@ mod mount_tests {
             mount_socket_path(6100).to_string_lossy()
         );
         assert_eq!(socket_mount.mount_type.as_deref(), Some("bind"));
+    }
+
+    #[test]
+    fn exposed_sockets_preserve_private_run_and_user_volumes() {
+        for guest_path in ["/var/run/docker.sock", "/run/control/app.sock", "/app.sock"] {
+            let mut spec = spec();
+            spec.add_bind_mount("/run/smolvm/virtiofs/shared", "/run/control", false);
+            let baseline = serde_json::to_value(&spec.mounts).unwrap();
+            let exposed = PublishedSocket {
+                vsock_port: 6200,
+                guest_path: guest_path.into(),
+                direction: SocketDirection::Expose,
+            };
+
+            inject_sockets_into_container(&mut spec, &[exposed]);
+
+            assert_eq!(serde_json::to_value(&spec.mounts).unwrap(), baseline);
+            let run = spec
+                .mounts
+                .iter()
+                .find(|mount| mount.destination == "/run")
+                .unwrap();
+            assert_eq!(run.mount_type.as_deref(), Some("tmpfs"));
+        }
+    }
+
+    #[test]
+    fn mixed_socket_directions_inject_only_the_individual_host_socket() {
+        let mut spec = spec();
+        let baseline = spec.mounts.len();
+        let sockets = [
+            PublishedSocket {
+                vsock_port: 6200,
+                guest_path: "/run/control/app.sock".into(),
+                direction: SocketDirection::Expose,
+            },
+            mount_sock(6201, "/run/control/host.sock"),
+        ];
+
+        inject_sockets_into_container(&mut spec, &sockets);
+
+        assert_eq!(spec.mounts.len(), baseline + 1);
+        let mount = spec.mounts.last().unwrap();
+        assert_eq!(mount.destination, "/run/control/host.sock");
+        assert_eq!(mount.source, mount_socket_path(6201).to_string_lossy());
     }
 }
 
@@ -606,5 +655,33 @@ mod tests {
         server_thread.join().unwrap();
         relay_thread.join().unwrap();
         assert_eq!(&resp, b"pong");
+    }
+}
+
+/// Dial the guest app's socket where the workload can actually see it.
+///
+/// On an `--image` machine the app runs under crun with its own mount
+/// namespace, so the socket it binds does not exist in the agent's namespace at
+/// all — a direct connect finds nothing and the host client hangs waiting for a
+/// server that is listening a namespace away. With no container running the
+/// agent's own namespace IS the workload's, and the direct connect is right.
+// Same gate as the bridge that calls it.
+#[cfg(target_os = "linux")]
+pub(crate) fn dial_app(guest_path: &str) -> io::Result<std::os::unix::net::UnixStream> {
+    match crate::nsfile::GuestNs::for_workload() {
+        crate::nsfile::GuestNs::Container(ns) => ns
+            .connect(guest_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::NotConnected, e)),
+        // Carry WHY we are dialing here into the error. A bare "not reachable"
+        // cannot distinguish "the app is not listening" from "the app is
+        // listening in a container we declined to enter", which is the whole
+        // failure this path exists to fix.
+        crate::nsfile::GuestNs::Root(reason) => std::os::unix::net::UnixStream::connect(guest_path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("{e} (dialed in the VM namespace: {reason})"),
+                )
+            }),
     }
 }

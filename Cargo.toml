@@ -13,6 +13,7 @@ members = [
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
+    "crates/smolvm-s3fs",
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
 ]
@@ -20,7 +21,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.8.3"
+version = "1.16.2"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -37,19 +38,19 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "crates/smolvm-network", version = "1.7.5" }
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.5" }
-smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.7.5" }
-smolvm-pack = { path = "crates/smolvm-pack", version = "1.7.5" }
-smolvm-registry = { path = "crates/smolvm-registry", version = "1.7.5" }
-smolfile = { path = "crates/smolvm-smolfile", version = "1.7.5" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.16.2" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.16.2" }
+smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.16.2" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.16.2" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.16.2" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.16.2" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 libc = "0.2"
 # Cross-platform dynamic library loading for libkrun (dlopen on Unix,
 # LoadLibraryW on Windows). Replaces the previous direct libc::dlopen path.
@@ -59,7 +60,10 @@ libloading = "0.8"
 # on Windows 10 1809+. See src/platform/uds.rs.
 socket2 = "0.6"
 dirs = "5"
+sha1 = "0.10"
 sha2 = "0.10"
+ring = "0.17.14"
+zstd = "0.13"
 hex = "0.4"
 getrandom = "0.3"
 # Host filesystem watcher (FSEvents on macOS, inotify on Linux) that drives
@@ -75,6 +79,9 @@ base64 = { workspace = true }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 humantime = "2"
 tempfile = "3"
+tar = "0.4"
+# Inspect and safely rebase qcow2 backing chains in portable checkpoints.
+imago = { version = "0.2.3", features = ["sync-wrappers"] }
 
 # HTTP API server
 tokio = { version = "1", features = ["full"] }
@@ -83,7 +90,7 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 # does the TLS handshake + client-cert verification; rustls-pemfile parses the
 # CA/cert/key PEMs handed to us at enrollment.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
@@ -96,9 +103,9 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
 # OpenAPI documentation
-utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-axum = "0.2"
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa = { version = "6", features = ["axum_extras"] }
+utoipa-axum = "0.3"
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }
 ipnet = "2.12.0"
 metrics = "0.24"
 
@@ -127,7 +134,7 @@ windows-sys = { version = "0.60", features = [
 
 [dev-dependencies]
 tempfile = "3"
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.5" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.16.2" }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

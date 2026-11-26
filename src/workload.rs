@@ -8,17 +8,22 @@
 
 use crate::agent::{AgentClient, RunConfig};
 use crate::config::VmRecord;
-use crate::data::storage::HostMount;
 
-/// Convert a `VmRecord` mount list (`(host_source, guest_target, read_only)`
-/// triples) to the agent's virtiofs binding format. The host source is
-/// dropped — the agent only needs the guest-facing target and the positional
-/// `smolvm{i}` tag.
-pub fn record_mounts_to_bindings(mounts: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
-    mounts
+/// Convert a record's live and staged host mounts to the agent's binding form.
+/// Reconstructing the rich list preserves original device order, while staged
+/// mounts use their stable runtime identity instead of a plain virtiofs tag.
+pub fn record_mounts_to_bindings(record: &VmRecord) -> Vec<(String, String, bool)> {
+    record
+        .host_mounts()
         .iter()
         .enumerate()
-        .map(|(i, (_host, target, ro))| (HostMount::mount_tag(i), target.clone(), *ro))
+        .map(|(i, mount)| {
+            (
+                mount.runtime_mount_tag(i),
+                mount.target.to_string_lossy().into_owned(),
+                mount.read_only,
+            )
+        })
         .collect()
 }
 
@@ -32,7 +37,18 @@ pub fn record_mounts_to_bindings(mounts: &[(String, String, bool)]) -> Vec<(Stri
 /// renaming the directory on disk, keeps that live mount valid while making
 /// the clone's execs land in the inherited state.
 pub fn persistent_overlay_owner(name: &str, golden: Option<&str>) -> String {
-    golden.unwrap_or(name).to_string()
+    persistent_overlay_owner_with_lineage(name, golden, None)
+}
+
+/// Resolve the persistent overlay owner for a machine whose immediate parent
+/// may itself be a fork. `fork_overlay_owner` keeps every generation pointed
+/// at the root overlay inherited by the live restored workload.
+pub fn persistent_overlay_owner_with_lineage(
+    name: &str,
+    golden: Option<&str>,
+    fork_overlay_owner: Option<&str>,
+) -> String {
+    fork_overlay_owner.or(golden).unwrap_or(name).to_string()
 }
 
 /// Launch an image machine's workload container in the background.
@@ -41,8 +57,8 @@ pub fn persistent_overlay_owner(name: &str, golden: Option<&str>) -> String {
 /// a host-side concern the caller owns. An empty entrypoint+cmd makes the
 /// agent resolve the image's own ENTRYPOINT+CMD, so service-style images
 /// start as their authors intended. The persistent overlay is keyed by
-/// [`persistent_overlay_owner`] (the machine name, or the golden's for a fork
-/// clone) so filesystem state survives restarts and forks.
+/// [`persistent_overlay_owner_with_lineage`] (the machine name, or the root
+/// golden's for a fork clone) so filesystem state survives restarts and forks.
 ///
 /// Returns `Ok(false)` (no launch) for machines without an image, and for
 /// image machines where neither the record nor the image supplies a command —
@@ -57,21 +73,36 @@ pub fn launch_image_workload(
     exec_env: Vec<(String, String)>,
 ) -> crate::Result<bool> {
     let Some(ref image) = record.image else {
+        // Remote volumes mount inside a workload container, which a machine with
+        // no image never launches — honoring the volume is impossible. Fail
+        // loudly instead of silently dropping it.
+        if !record.remote_volumes.is_empty() {
+            return Err(crate::Error::agent(
+                "launch workload",
+                "remote volumes require an image-backed machine — there is no \
+                 workload container to mount into",
+            ));
+        }
         return Ok(false);
     };
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
-    match client.run_container_detached(
-        RunConfig::new(image, command)
-            .with_env(exec_env)
-            .with_workdir(record.workdir.clone())
-            .with_user(record.user.clone())
-            .with_mounts(record_mounts_to_bindings(&record.mounts))
-            .with_persistent_overlay(Some(persistent_overlay_owner(
-                machine_name,
-                record.golden.as_deref(),
-            ))),
-    ) {
+    // Remote volumes are mounted by the agent itself, natively, between the
+    // container's create and start — so the workload sees its data from its
+    // first instruction and its command is never rewritten.
+    let _ticker =
+        WaitTicker::start("preparing the workload (a first start unpacks the machine image)");
+    let launch = |client: &mut AgentClient| {
+        client.run_container_detached(
+            RunConfig::new(image, command.clone())
+                .with_workdir(record.workdir.clone())
+                .with_user(record.user.clone())
+                .with_mounts(record_mounts_to_bindings(record))
+                .in_machine(record, machine_name, &exec_env)
+                .with_env(exec_env.clone()),
+        )
+    };
+    match launch(client) {
         Ok(_) => Ok(true),
         Err(e) if is_missing_launch_metadata(&e.to_string()) => {
             tracing::info!(
@@ -80,6 +111,26 @@ pub fn launch_image_workload(
                 "image defines no entrypoint or cmd and none was given; booting bare agent without a workload"
             );
             Ok(false)
+        }
+        Err(e) if is_image_missing(&e.to_string()) => {
+            // The agent discards a cached image whose layers no longer verify
+            // — an unclean shutdown can leave a layer without its completion
+            // marker — and then reports the image as missing. It has no way to
+            // fetch a replacement on its own, so pull it again here and launch
+            // once more. Without this a machine whose host was killed mid-run
+            // stays permanently unstartable, reporting only "image not found"
+            // for an image it holds a record of.
+            tracing::info!(
+                machine = machine_name,
+                image = %image,
+                "cached image is no longer usable; pulling it again before launching"
+            );
+            client
+                .pull_with_registry_config(image)
+                .map_err(|e| crate::Error::agent("start background CMD", format!("{e}")))?;
+            launch(client)
+                .map(|_| true)
+                .map_err(|e| crate::Error::agent("start background CMD", format!("{e}")))
         }
         Err(e) => Err(crate::Error::agent("start background CMD", format!("{e}"))),
     }
@@ -93,9 +144,105 @@ fn is_missing_launch_metadata(message: &str) -> bool {
     message.contains("defines no entrypoint or cmd")
 }
 
+/// Whether a detached-run failure means the guest no longer holds the image.
+/// Matched on the agent's message for the same reason as
+/// [`is_missing_launch_metadata`]: only the guest knows its image store.
+fn is_image_missing(message: &str) -> bool {
+    message.contains("image not found")
+}
+
+/// Progress heartbeat for a long workload launch.
+///
+/// A pack machine's first start unpacks the whole flattened image before the
+/// workload can run — minutes of silence that read as a hang. After a short
+/// grace period this prints an elapsed-time line to stderr: rewritten in
+/// place on a terminal, one line every 30 s when piped. Dropping the guard
+/// stops the ticker and clears the line.
+struct WaitTicker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WaitTicker {
+    fn start(what: &'static str) -> Self {
+        use std::io::{IsTerminal, Write};
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let tty = std::io::stderr().is_terminal();
+            let grace = std::time::Duration::from_secs(3);
+            let step = if tty {
+                std::time::Duration::from_secs(1)
+            } else {
+                std::time::Duration::from_secs(30)
+            };
+            let mut printed = false;
+            while !stop_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if started.elapsed() < grace {
+                    continue;
+                }
+                let due = match printed {
+                    false => true,
+                    true => started.elapsed().as_millis() % step.as_millis() < 250,
+                };
+                if !due {
+                    continue;
+                }
+                let secs = started.elapsed().as_secs();
+                let mut err = std::io::stderr();
+                if tty {
+                    let _ = write!(err, "\r  {what}... {secs}s");
+                } else {
+                    let _ = writeln!(err, "  {what}... {secs}s");
+                }
+                let _ = err.flush();
+                printed = true;
+            }
+            if printed && tty {
+                let mut err = std::io::stderr();
+                let _ = write!(err, "\r{}\r", " ".repeat(what.len() + 16));
+                let _ = err.flush();
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for WaitTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An image the guest dropped (its layers stopped verifying after an
+    // unclean shutdown) must be recognised so the launcher re-pulls it
+    // instead of leaving the machine unstartable. The agent's own
+    // "defines no entrypoint or cmd" case must not be mistaken for it.
+    #[test]
+    fn missing_image_is_told_apart_from_a_commandless_image() {
+        assert!(is_image_missing(
+            "run container detached: image not found: docker.io/library/ubuntu:latest"
+        ));
+        assert!(!is_image_missing(
+            "run container detached: image defines no entrypoint or cmd"
+        ));
+        assert!(!is_missing_launch_metadata(
+            "run container detached: image not found: docker.io/library/ubuntu:latest"
+        ));
+    }
 
     // A plain machine's overlay is keyed by its own name; a fork clone's by
     // its golden's name, so clone execs land in the CoW-inherited overlay
@@ -107,6 +254,31 @@ mod tests {
             persistent_overlay_owner("clone-a", Some("golden-a")),
             "golden-a"
         );
+        assert_eq!(
+            persistent_overlay_owner_with_lineage("grandchild", Some("child"), Some("root")),
+            "root"
+        );
+    }
+
+    #[test]
+    fn bindings_preserve_staged_mount_order_and_identity() {
+        let mut record = VmRecord::new(
+            "test".into(),
+            1,
+            256,
+            vec![("/host/live".into(), "/live".into(), true)],
+            Vec::new(),
+            false,
+        );
+        record.staged_mounts = vec![(0, "/host/staged".into(), "/work".into())];
+
+        let bindings = record_mounts_to_bindings(&record);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings[0].0.starts_with("staged+"));
+        assert!(bindings[0].0.ends_with("+smolvm0"));
+        assert_eq!(bindings[0].1, "/work");
+        assert!(!bindings[0].2);
+        assert_eq!(bindings[1], ("smolvm1".into(), "/live".into(), true));
     }
 
     // Only the agent's metadata-less-image failure downgrades a machine start

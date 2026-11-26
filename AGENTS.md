@@ -10,7 +10,7 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 | Linux x86_64 / aarch64 | matching Linux | KVM | `/dev/kvm` |
 | Windows x86_64 | x86_64 Linux | Windows Hypervisor Platform (WHP) | WHP feature enabled |
 
-Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no fork/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
+Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no branch/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
 
 ## Quick Reference
 
@@ -169,6 +169,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
 | `--volume` | `-v` | run, create, update | Mount host dir: `HOST:GUEST[:ro]` |
+| `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
 | `--port` | `-p` | run, create, update | Port mapping: `HOST:GUEST` |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec | Keep stdin open |
@@ -330,9 +331,8 @@ Not available on Windows (WHP) — `--gpu` has no effect there.
 
 ```bash
 # One-shot GPU workload
-smolvm machine run --gpu --image alpine -- sh -c '
-  apk add --no-cache mesa-vulkan-virtio vulkan-tools
-  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json \
+smolvm machine run --net --gpu --image alpine -- sh -c '
+  apk add --no-cache mesa-vulkan-virtio vulkan-loader vulkan-tools
   vulkaninfo --summary 2>/dev/null | grep deviceName
 '
 # → deviceName = Virtio-GPU Venus (Intel(R) UHD Graphics ...)
@@ -345,12 +345,16 @@ smolvm machine exec --name browser -- \
     --screenshot=/tmp/out.png --window-size=1280,800 https://example.com
 ```
 
-The guest must set `VK_ICD_FILENAMES` so the Vulkan loader finds the virtio ICD. Put it in `env` in a Smolfile to avoid repeating it on every exec:
+The guest does not need `VK_ICD_FILENAMES`: Mesa's ICD manifest is where the
+Vulkan loader already looks, and on a glibc image smolvm bind-mounts its own
+Venus driver and pins the loader to it. Setting the variable overrides that
+pin, and the manifest name is architecture-specific
+(`virtio_icd.x86_64.json` / `virtio_icd.aarch64.json`), so a hardcoded path
+breaks on the other arch:
 
 ```toml
 gpu = true
 gpu_vram = 2048
-env = ["VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"]
 ```
 
 For a complete working example see [`examples/headless-browser/browser.smolfile`](examples/headless-browser/browser.smolfile).

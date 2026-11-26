@@ -101,6 +101,23 @@ fn has_frozen_fork_state(name: &str, record: &VmRecord) -> bool {
     let Ok(db) = SmolvmDb::open() else {
         return false;
     };
+    let retained = db
+        .retained_fork_snapshot(name)
+        .ok()
+        .flatten()
+        .filter(|snapshot| {
+            crate::agent::fork::retained_snapshot_matches_golden(
+                record,
+                &crate::agent::vm_data_dir(name).join("s"),
+                snapshot,
+            )
+        });
+    if retained
+        .as_ref()
+        .is_some_and(crate::agent::fork::retained_snapshot_source_continues)
+    {
+        return false;
+    }
     if db
         .dependent_clones(name)
         .map(|clones| !clones.is_empty())
@@ -108,17 +125,7 @@ fn has_frozen_fork_state(name: &str, record: &VmRecord) -> bool {
     {
         return true;
     }
-    db.retained_fork_snapshot(name)
-        .ok()
-        .flatten()
-        .map(|snapshot| {
-            crate::agent::fork::retained_snapshot_matches_golden(
-                record,
-                &crate::agent::vm_data_dir(name).join("s"),
-                &snapshot,
-            )
-        })
-        .unwrap_or(false)
+    retained.is_some()
 }
 
 /// Tear down a zombie libkrun VMM (live PID, dead agent) and clear
@@ -137,7 +144,10 @@ pub fn recover_unreachable_machine(record: &VmRecord) -> crate::Result<()> {
     recover_unreachable_machine_in_db(record, &db)
 }
 
-fn recover_unreachable_machine_in_db(record: &VmRecord, db: &SmolvmDb) -> crate::Result<()> {
+pub(crate) fn recover_unreachable_machine_in_db(
+    record: &VmRecord,
+    db: &SmolvmDb,
+) -> crate::Result<()> {
     if let Some(pid) = record.pid {
         if crate::process::is_alive(pid) {
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {

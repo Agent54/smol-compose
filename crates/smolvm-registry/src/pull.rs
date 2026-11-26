@@ -14,7 +14,8 @@ use crate::{OciManifest, RegistryError, Result, LAYER_MEDIA_TYPE};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Result of a successful pull.
 #[derive(Debug)]
@@ -47,6 +48,34 @@ pub async fn pull(
     output: Option<&Path>,
     cache: &BlobCache,
     blob_peers: &[String],
+) -> Result<PullResult> {
+    pull_with_progress(
+        client,
+        repo,
+        reference,
+        output,
+        cache,
+        blob_peers,
+        &mut |_, _| {},
+    )
+    .await
+}
+
+/// [`pull`], reporting download progress.
+///
+/// `on_progress` is called with `(bytes_on_disk, total_bytes)` as the layer
+/// streams in, on every chunk — callers throttle their own rendering. It is not
+/// called for a cache hit or a peer fetch, neither of which downloads from the
+/// registry, and `bytes_on_disk` starts from the resume point when a retry
+/// picks up a partial file rather than restarting at zero.
+pub async fn pull_with_progress(
+    client: &RegistryClient,
+    repo: &str,
+    reference: &str,
+    output: Option<&Path>,
+    cache: &BlobCache,
+    blob_peers: &[String],
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<PullResult> {
     // 1. Fetch the manifest, resolving a multi-platform index to this machine's
     //    host-platform entry (Docker-style fan-out). Shared with `inspect`.
@@ -109,16 +138,213 @@ pub async fn pull(
         }
     }
 
-    // 5. Stream blob from the registry to disk while computing + verifying the
-    //    digest, then adopt into cache.
+    // 5. Stream blob from the registry to disk, resuming and retrying a broken
+    //    transfer, then verify the digest and adopt into cache.
     tracing::info!(digest = %digest, size, "downloading blob...");
 
-    let stream = client.pull_blob_stream(repo, digest).await?;
-    let result = stream_verify_adopt(stream, digest, output, cache).await?;
+    let result =
+        download_with_resume(client, repo, digest, size, output, cache, on_progress).await?;
 
     tracing::info!(digest = %digest, size = result.size, "pull complete");
 
     Ok(result)
+}
+
+/// Attempts allowed for one blob (first try plus retries).
+const MAX_ATTEMPTS: u32 = 5;
+
+/// Delay before the first retry; doubles each attempt.
+const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Download `digest` into the cache, resuming a partial file across attempts.
+///
+/// Each attempt appends to `<digest>.partial` from wherever the last one stopped,
+/// so a 90 MiB layer that breaks at 80 MiB resumes at 80 MiB instead of starting
+/// over — the difference between converging and never finishing when a registry
+/// drops long transfers. Retries are bounded and backed off, so a genuinely
+/// broken blob fails in seconds with a real error instead of hammering the
+/// registry forever (the retry storm that hid the original fault).
+///
+/// The digest is verified from the finished file rather than hashed incrementally
+/// while streaming: resumed attempts would otherwise need the hasher state from a
+/// previous attempt. Re-reading is cheap next to the transfer, and it verifies
+/// exactly the bytes that landed on disk.
+async fn download_with_resume(
+    client: &RegistryClient,
+    repo: &str,
+    digest: &str,
+    expected_size: u64,
+    output: Option<&Path>,
+    cache: &BlobCache,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<PullResult> {
+    let partial_path = cache.blob_path_for(digest).with_extension("partial");
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Resume from whatever a previous attempt left behind. A stale partial
+        // from an earlier pull is fine: the digest check at the end rejects it,
+        // and a mismatch clears it so the next pull starts clean.
+        let have = tokio::fs::metadata(&partial_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        match fetch_into_partial(
+            client,
+            repo,
+            digest,
+            have,
+            expected_size,
+            &partial_path,
+            on_progress,
+        )
+        .await
+        {
+            Ok(written) => {
+                let actual = hash_file(&partial_path).await?;
+                if actual != *digest {
+                    // Corrupt or mismatched bytes: remove them so a retry cannot
+                    // resume onto a poisoned prefix, and fail — retrying the same
+                    // content would only reproduce the mismatch.
+                    if let Err(e) = tokio::fs::remove_file(&partial_path).await {
+                        tracing::warn!(
+                            error = %e,
+                            path = %partial_path.display(),
+                            "failed to clean up partial blob after digest mismatch"
+                        );
+                    }
+                    return Err(RegistryError::DigestMismatch {
+                        expected: digest.to_string(),
+                        actual,
+                    });
+                }
+
+                let cached_path = cache.adopt(digest, written)?;
+                let result_path = if let Some(out) = output {
+                    tokio::fs::copy(&cached_path, out).await?;
+                    PathBuf::from(out)
+                } else {
+                    cached_path
+                };
+                return Ok(PullResult {
+                    path: result_path,
+                    digest: digest.to_string(),
+                    size: written,
+                    cached: false,
+                });
+            }
+            Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
+                let backoff = RETRY_BACKOFF * 2u32.pow(attempt - 1);
+                // Report what is actually on disk, not `have`: that was read
+                // before the attempt, so a transfer that broke after gigabytes
+                // logged `have_bytes=0` and read as "downloaded nothing" when
+                // the next attempt in fact resumes from near the end.
+                let on_disk = tokio::fs::metadata(&partial_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(have);
+                tracing::warn!(
+                    digest = %digest,
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    bytes_on_disk = on_disk,
+                    resumed_from = have,
+                    total_bytes = expected_size,
+                    backoff_ms = backoff.as_millis(),
+                    error = %e,
+                    "blob download interrupted; resuming after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!("loop returns on the final attempt")
+}
+
+/// One download attempt: append the blob to `partial_path` starting at `have`.
+///
+/// Returns the total bytes on disk when the body ends.
+async fn fetch_into_partial(
+    client: &RegistryClient,
+    repo: &str,
+    digest: &str,
+    have: u64,
+    expected_size: u64,
+    partial_path: &Path,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<u64> {
+    let (stream, resumed_at) = client.pull_blob_stream_from(repo, digest, have).await?;
+
+    // `resumed_at == 0` with bytes already on disk means the registry ignored the
+    // Range header and is resending the whole blob, so the partial must be
+    // truncated — appending would produce a file with a duplicated prefix.
+    let mut file = if resumed_at > 0 {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(partial_path)
+            .await?
+    } else {
+        tokio::fs::File::create(partial_path).await?
+    };
+
+    let mut written = resumed_at;
+    let mut stream = std::pin::pin!(stream);
+    while let Some(chunk_result) = stream.next().await {
+        let chunk: bytes::Bytes = chunk_result.map_err(RegistryError::Http)?;
+        file.write_all(&chunk).await?;
+        written += chunk.len() as u64;
+        on_progress(written, expected_size);
+    }
+    file.flush().await?;
+    drop(file);
+
+    // A body that ends early is a truncated transfer, not a complete download.
+    // Without this the short file would reach the digest check, mismatch, and be
+    // deleted — throwing away bytes a resume could have kept.
+    if expected_size > 0 && written < expected_size {
+        return Err(RegistryError::DownloadStalled {
+            digest: digest.to_string(),
+            received: written,
+            total: expected_size,
+        });
+    }
+
+    Ok(written)
+}
+
+/// SHA-256 of a file on disk, read in chunks so a large layer is never buffered.
+async fn hash_file(path: &Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Whether a failed attempt is worth resuming.
+///
+/// Transport faults and 5xx are transient — exactly the mid-transfer breakage
+/// resume exists for. A missing blob, an auth failure, or a digest mismatch are
+/// terminal: retrying re-fetches the same wrong answer and only delays the error
+/// the caller needs to see.
+fn is_retryable(err: &RegistryError) -> bool {
+    match err {
+        RegistryError::Http(e) => {
+            e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode()
+        }
+        RegistryError::DownloadStalled { .. } => true,
+        RegistryError::Io(_) => false,
+        RegistryError::ApiError { status, .. } => *status >= 500,
+        _ => false,
+    }
 }
 
 /// Stream `stream` into the cache's `.partial` file for `digest`, hashing while
@@ -249,5 +475,205 @@ mod tests {
             "blob must be adopted into cache"
         );
         // MockServer drop asserts the blob endpoint's expect(1) was satisfied.
+    }
+
+    /// Build a manifest whose single layer declares `digest`/`size`.
+    fn manifest_for(digest: &str, size: usize) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": CONFIG_MEDIA_TYPE,
+                "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 2
+            },
+            "layers": [ { "mediaType": LAYER_MEDIA_TYPE, "digest": digest, "size": size } ],
+        })
+    }
+
+    /// A download reports progress while it streams: every callback carries the
+    /// running byte count and the layer's declared total, counts never go
+    /// backwards, and the last one reaches the full size. Without this a
+    /// multi-gigabyte pull prints one line and then looks hung for minutes.
+    #[tokio::test]
+    async fn pull_reports_download_progress() {
+        use sha2::{Digest, Sha256};
+
+        let data = vec![7u8; 64 * 1024];
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(&digest, data.len())).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let result = pull_with_progress(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &mut |done, total| seen.push((done, total)),
+        )
+        .await
+        .expect("pull must succeed");
+
+        assert!(!seen.is_empty(), "progress must be reported at least once");
+        assert!(
+            seen.iter().all(|&(_, total)| total == data.len() as u64),
+            "every callback carries the layer size declared in the manifest"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 <= w[1].0),
+            "byte counts must never go backwards"
+        );
+        assert_eq!(
+            seen.last().unwrap().0,
+            data.len() as u64,
+            "the final callback reaches the full size"
+        );
+        assert_eq!(result.size, data.len() as u64);
+    }
+
+    /// The incident behaviour: a transfer that dies mid-blob must RESUME from the
+    /// bytes already on disk, not restart at zero.
+    ///
+    /// The registry here truncates the first response, then serves the remainder
+    /// only to a ranged request. A client that restarts would keep receiving the
+    /// same truncated prefix forever; one that resumes completes on the second
+    /// attempt.
+    #[tokio::test]
+    async fn broken_transfer_resumes_instead_of_restarting() {
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::header_exists;
+
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+        let split = 1500;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(&digest, data.len())).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+
+        // Registered first so it wins for ranged requests: serve the tail as 206.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .and(header_exists("range"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(data[split..].to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Un-ranged first attempt: hand back a truncated body.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data[..split].to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        let result = pull(&client, "myrepo", "latest", None, &cache, &[])
+            .await
+            .expect("a truncated transfer must be resumed and completed");
+
+        assert_eq!(
+            result.size,
+            data.len() as u64,
+            "full blob must land on disk"
+        );
+        assert_eq!(result.digest, digest);
+        let cached = cache.get(&digest).expect("blob must be adopted into cache");
+        assert_eq!(
+            tokio::fs::read(&cached).await.unwrap(),
+            data,
+            "resumed file must be byte-identical, not a duplicated prefix"
+        );
+        // Each expect(1) asserts the resume happened exactly once: one truncated
+        // attempt, one ranged continuation.
+    }
+
+    /// A terminal failure must NOT be retried. A missing blob is the same answer
+    /// however many times it is asked for, and retrying only delays the error.
+    #[tokio::test]
+    async fn missing_blob_fails_without_retrying() {
+        let digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(digest, 64)).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        let err = pull(&client, "myrepo", "latest", None, &cache, &[])
+            .await
+            .expect_err("a missing blob must fail");
+        assert!(
+            matches!(err, RegistryError::BlobNotFound(_)),
+            "expected BlobNotFound, got {err:?}"
+        );
+        // expect(1) asserts the blob endpoint was hit once, not MAX_ATTEMPTS times.
+    }
+
+    /// Retry classification: transient transport/5xx faults resume, terminal ones
+    /// do not. This is what keeps a broken pull from becoming a retry storm.
+    #[test]
+    fn retry_classification_splits_transient_from_terminal() {
+        assert!(is_retryable(&RegistryError::DownloadStalled {
+            digest: "sha256:x".into(),
+            received: 1,
+            total: 2,
+        }));
+        assert!(is_retryable(&RegistryError::ApiError {
+            status: 503,
+            body: String::new(),
+        }));
+        assert!(!is_retryable(&RegistryError::ApiError {
+            status: 404,
+            body: String::new(),
+        }));
+        assert!(!is_retryable(&RegistryError::BlobNotFound("x".into())));
+        assert!(!is_retryable(&RegistryError::DigestMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        }));
     }
 }

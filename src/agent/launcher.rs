@@ -40,14 +40,6 @@ use super::{KrunFunctions, PortMapping, VmResources};
 /// a host resolves to many IPs across many refresh cycles.
 const EGRESS_CIDR_CAP: usize = 512;
 
-/// Hidden benchmark knob for root virtiofs DAX.
-///
-/// Default configures the root virtiofs device with a 512 MB DAX window (the
-/// same default the removed `krun_set_root` used). Set `SMOLVM_ROOTFS_DAX=0` to
-/// use `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)`,
-/// disabling the root DAX region for benchmarking.
-const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
-
 /// Stable tmpfs directory used by one VM's CUDA file-ring transport.
 ///
 /// The path is derived from the full per-VM runtime directory rather than its
@@ -137,14 +129,6 @@ fn create_owned_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(0o700).create(path)
 }
-
-/// Root virtiofs DAX window (512 MB), matching the default the removed
-/// `krun_set_root` configured. DAX gives the host a coherent shared mapping of
-/// the root fs so the guest agent's ready-marker write is visible to the host
-/// immediately. Plain `krun_add_virtiofs` passes shm_size=0 (no DAX), dropping
-/// virtiofs to writeback caching — the marker isn't seen until the multi-second
-/// socket-probe grace, regressing boot time from ~hundreds of ms to ~5 s.
-const ROOTFS_DAX_WINDOW: u64 = 1 << 29;
 
 /// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
 type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
@@ -480,10 +464,14 @@ impl LaunchFeatures {
             return Ok(self);
         }
 
-        if !smolvm_pack::extract::is_extracted(layers_cache_dir) {
+        let marker_present = smolvm_pack::extract::is_extracted(layers_cache_dir);
+        if !marker_present || !smolvm_pack::extract::cached_layers_usable(layers_cache_dir) {
             // Fallback: layers not yet extracted into this machine's own dir
-            // (pre-this-layout machine, or an interrupted create). Extract from
-            // the source bundle, which must still be present in that case.
+            // (pre-this-layout machine, or an interrupted create), OR the
+            // extraction marker survived while the layer files themselves were
+            // deleted (cache cleaners take the large files and leave the tiny
+            // marker). Extract from the source bundle, which must still be
+            // present in that case; force past the marker when it lies.
             let sidecar = Path::new(sidecar_path);
             if !sidecar.exists() {
                 return Err(Error::agent(
@@ -496,10 +484,22 @@ impl LaunchFeatures {
                     ),
                 ));
             }
+            if marker_present {
+                tracing::info!(
+                    cache = %layers_cache_dir.display(),
+                    "layer cache marked extracted but unusable; re-extracting from the source bundle"
+                );
+            }
             let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
                 .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
-            smolvm_pack::extract::extract_sidecar(sidecar, layers_cache_dir, &footer, false, false)
-                .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(
+                sidecar,
+                layers_cache_dir,
+                &footer,
+                marker_present,
+                false,
+            )
+            .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
         }
 
         let layers_lease = smolvm_pack::extract::acquire_layers_lease(layers_cache_dir, false)
@@ -694,6 +694,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         source: dir,
                         target: std::path::PathBuf::from("/opt/smolvm-ring"),
                         read_only: false,
+                        staged: false,
                     });
                 }
             }
@@ -712,6 +713,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     })?;
     let krun =
         unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
+    if resources.gpu {
+        krun.ensure_gpu_runtime()
+            .map_err(|e| Error::agent("configure gpu", e))?;
+    }
     boot_timing!("dylib loaded");
 
     // Pre-read the agent binary into the OS page cache so the virtiofs thread
@@ -734,9 +739,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_create_ctx = krun.create_ctx;
         let krun_free_ctx = krun.free_ctx;
         let krun_set_vm_config = krun.set_vm_config;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let krun_set_cpu_template = krun.set_cpu_template;
         let krun_set_workdir = krun.set_workdir;
         let krun_set_exec = krun.set_exec;
         let krun_add_disk2 = krun.add_disk2;
+        let krun_add_disk4 = krun.add_disk4;
         let krun_add_vsock_port2 = krun.add_vsock_port2;
         let krun_set_port_map = krun.set_port_map;
         let krun_add_virtiofs = krun.add_virtiofs;
@@ -765,6 +773,50 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let cpu_profile_result = krun_set_cpu_template(ctx, 1);
+            if cpu_profile_result < 0 && cpu_profile_result != -libc::ENOTSUP {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure vm",
+                    "libkrun does not support the portable CPU profile",
+                ));
+            }
+        }
+
+        // Expose the host's virtualization extensions so the guest can run KVM
+        // (smolvm, QEMU, anything needing /dev/kvm). Refuse up front when the
+        // host cannot offer it: the alternative is a VM that boots fine and then
+        // fails deep inside the guest with a confusing "KVM not available".
+        if resources.nested_virt {
+            let set_nested = krun.set_nested_virt.ok_or_else(|| {
+                Error::agent(
+                    "nested virtualization",
+                    "this libkrun build has no krun_set_nested_virt; update the bundled library"
+                        .to_string(),
+                )
+            })?;
+            if let Some(check) = krun.check_nested_virt {
+                let supported = check();
+                if supported != 1 {
+                    return Err(Error::agent(
+                        "nested virtualization",
+                        format!(
+                            "the host cannot expose virtualization extensions (check returned {supported}).                              On Apple silicon this needs an M3 or newer and macOS 15+; on Linux it needs                              nested KVM enabled (kvm_intel.nested=1 or kvm_amd nested=1)."
+                        ),
+                    ));
+                }
+            }
+            let rc = set_nested(ctx, true);
+            if rc < 0 {
+                return Err(Error::agent(
+                    "nested virtualization",
+                    format!("krun_set_nested_virt failed (rc={rc})"),
+                ));
+            }
+            tracing::info!("nested virtualization enabled for the guest");
         }
 
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
@@ -801,6 +853,111 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             }
             tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+
+            // Optional virtio-gpu scanout. Venus gives the guest GPU
+            // *rendering*; a scanout gives it a *display*. With no display the
+            // device reports num_scanouts = 0, the guest creates no connector,
+            // and card0 is a render node only — which is why DRM compositors
+            // (Hyprland, GNOME, KDE) refuse to start with "not a KMS device".
+            //
+            // Opt-in: a connector changes guest topology, and existing GPU
+            // workloads (CUDA, headless Vulkan) neither need nor want one.
+            if let Some((w, h)) =
+                super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
+            {
+                super::default_gpu_backend_for_display();
+                let add_display = match krun.add_display {
+                    Some(f) => f,
+                    None => {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure display",
+                            "SMOLVM_DISPLAY set but this libkrun has no krun_add_display",
+                        ));
+                    }
+                };
+                let ret = add_display(ctx, w, h);
+                if ret < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure display",
+                        format!("krun_add_display({w}x{h}) failed (ret={ret})"),
+                    ));
+                }
+                tracing::info!(
+                    width = w,
+                    height = h,
+                    display_id = ret,
+                    "virtio-gpu scanout added (guest gets a KMS connector)"
+                );
+
+                // A described display is not a usable one. Without a backend
+                // to consume frames libkrun installs a no-op that fails every
+                // scanout call, so the guest's first page flip never completes
+                // and the compositor blocks on it forever. Register the host
+                // framebuffer that actually takes the frames.
+                let set_backend = match krun.set_display_backend {
+                    Some(f) => f,
+                    None => {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure display",
+                            "SMOLVM_DISPLAY set but this libkrun has no \
+                             krun_set_display_backend; without it the guest \
+                             would hang on its first page flip",
+                        ));
+                    }
+                };
+                let framebuffer = match super::display::install(set_backend, ctx) {
+                    Ok(fb) => fb,
+                    Err(e) => {
+                        krun_free_ctx(ctx);
+                        return Err(e);
+                    }
+                };
+
+                // Serving RFB from the host means the guest needs no capture
+                // tool and no compositor-specific screencopy protocol.
+                if let Some(bind) = std::env::var("SMOLVM_VNC")
+                    .ok()
+                    .as_deref()
+                    .and_then(super::vnc::parse_bind_addr)
+                {
+                    // Input is best-effort: a libkrun without the input
+                    // feature (or an install failure) degrades the session to
+                    // view-only rather than blocking the display.
+                    let input = match krun.add_input_device {
+                        Some(add_input) => match super::input::install(add_input, ctx) {
+                            Ok(i) => {
+                                tracing::info!("vnc input devices attached (keyboard + pointer)");
+                                Some(i)
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "vnc input unavailable; view-only");
+                                None
+                            }
+                        },
+                        None => {
+                            tracing::info!(
+                                "libkrun has no krun_add_input_device; vnc is view-only"
+                            );
+                            None
+                        }
+                    };
+                    match super::vnc::serve(&bind, framebuffer, input) {
+                        Ok(addr) => tracing::info!(
+                            %addr,
+                            url = %super::vnc::browser_url(addr),
+                            "vnc server listening"
+                        ),
+                        Err(e) => {
+                            // A failed viewer must not take down the VM: the
+                            // display itself is already working without it.
+                            tracing::warn!(bind = %bind, error = %e, "vnc server failed to start");
+                        }
+                    }
+                }
+            }
         }
 
         // Helper: evaluate a fallible expression, freeing ctx if it fails.
@@ -820,17 +977,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Set root filesystem via the root virtiofs tag ("/dev/root").
         //
         // Upstream libkrun removed krun_set_root in favor of krun_add_virtiofs*
-        // with KRUN_FS_ROOT_TAG. Default path: krun_add_virtiofs, preserving the
-        // established rootfs DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0
-        // uses krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
-        // while keeping the root read-write.
+        // with KRUN_FS_ROOT_TAG. Use virtiofs3 for both policy states so every
+        // launcher interprets the shared rootfs DAX setting identically.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
         let root_tag = cstr("/dev/root");
-        if rootfs_dax_disabled() {
+        let rootfs_dax_window = super::virtiofs::rootfs_dax_window();
+        if rootfs_dax_window == 0 {
             let Some(add_virtiofs3) = krun_add_virtiofs3 else {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -863,7 +1019,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ctx,
                 root_tag.as_ptr(),
                 root.as_ptr(),
-                ROOTFS_DAX_WINDOW,
+                rootfs_dax_window,
                 false,
             ) < 0
             {
@@ -1026,9 +1182,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 let mut guest_network = GuestNetworkConfig::default();
                 guest_network.host_service = crate::network::launch::guest_host_service()
                     .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
-                // A custom resolver (--dns) becomes the gateway's upstream: the
-                // guest still points at the gateway (100.96.0.1), which forwards
-                // queries to this address instead of the default.
+                // On macOS, snapshot System DNS or use the custom server. The
+                // guest and Docker keep querying the gateway at 100.96.0.1.
+                #[cfg(target_os = "macos")]
+                {
+                    guest_network.upstream_dns =
+                        match crate::data::network::forwarded_dns(resources.dns) {
+                            Ok(server) => server,
+                            Err(error) => {
+                                krun_free_ctx(ctx);
+                                return Err(Error::config("DNS", error.to_string()));
+                            }
+                        };
+                }
+                #[cfg(not(target_os = "macos"))]
                 if let Some(dns) = resources.dns {
                     guest_network.upstream_dns = dns;
                 }
@@ -1285,18 +1452,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             "path contains null byte"
         );
         let storage_format = disks.storage.format().to_krun_u32();
-        if krun_add_disk2(
-            ctx,
-            block_id.as_ptr(),
-            disk_path.as_ptr(),
-            storage_format,
-            false,
-        ) < 0
-        {
+        let storage_result = add_block_disk(
+            BlockDisk {
+                ctx,
+                block_id: block_id.as_ptr(),
+                disk_path: disk_path.as_ptr(),
+                disk_format: storage_format,
+                read_only: false,
+            },
+            resources.block_io,
+            krun_add_disk2,
+            krun_add_disk4,
+        );
+        if storage_result < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent(
                 "add storage disk",
-                "krun_add_disk2 failed - VM cannot function without storage",
+                block_io_error("storage", resources.block_io, storage_result),
             ));
         }
 
@@ -1310,18 +1482,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "path contains null byte"
             );
             let overlay_format = overlay.format().to_krun_u32();
-            if krun_add_disk2(
-                ctx,
-                overlay_id.as_ptr(),
-                overlay_path.as_ptr(),
-                overlay_format,
-                false,
-            ) < 0
-            {
+            let overlay_result = add_block_disk(
+                BlockDisk {
+                    ctx,
+                    block_id: overlay_id.as_ptr(),
+                    disk_path: overlay_path.as_ptr(),
+                    disk_format: overlay_format,
+                    read_only: false,
+                },
+                resources.block_io,
+                krun_add_disk2,
+                krun_add_disk4,
+            );
+            if overlay_result < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add overlay disk",
-                    "krun_add_disk2 failed for rootfs overlay",
+                    block_io_error("overlay", resources.block_io, overlay_result),
                 ));
             }
         }
@@ -1340,18 +1517,28 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "add extra disk",
                 "path contains null byte"
             );
-            if krun_add_disk2(
-                ctx,
-                block_id.as_ptr(),
-                path.as_ptr(),
-                format.to_krun_u32(),
-                *read_only,
-            ) < 0
-            {
+            // Through the same helper the managed disks use, so `--block-io`
+            // reaches these too. Attaching them with a bare `krun_add_disk2`
+            // pinned them to the synchronous engine, which silently excluded
+            // the io_uring path from the one disk it exists for: a raw device
+            // a caller attached for a database.
+            let result = add_block_disk(
+                BlockDisk {
+                    ctx,
+                    block_id: block_id.as_ptr(),
+                    disk_path: path.as_ptr(),
+                    disk_format: format.to_krun_u32(),
+                    read_only: *read_only,
+                },
+                resources.block_io,
+                krun_add_disk2,
+                krun_add_disk4,
+            );
+            if result < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add extra disk",
-                    format!("krun_add_disk2 failed for extra disk {}", i),
+                    block_io_error(&format!("extra disk {i}"), resources.block_io, result),
                 ));
             }
             tracing::debug!(disk = i, path = %disk_path.display(), read_only, "added extra disk");
@@ -1502,14 +1689,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // a failed boot. See launcher_dynamic::truncate_console_log.
             super::launcher_dynamic::truncate_console_log(log_path);
             if krun.console_output_to_file(ctx, log_path) < 0 {
-                // Expected on Windows (fd-based console redirection is a no-op
-                // there); don't let a benign WARN mask the real boot failure the
-                // readiness monitor reports. See `boot_failure_reason`.
-                #[cfg(windows)]
-                tracing::debug!(
-                    "guest console not captured on Windows (fd redirection unsupported)"
-                );
-                #[cfg(not(windows))]
                 tracing::warn!("failed to set console output");
             }
         }
@@ -1548,22 +1727,66 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // process-level CPU idleness the balloon is pulsed so an idle guest's
         // page cache is evicted and handed back to the host.
         // SMOLVM_IDLE_RECLAIM=<minutes> tunes the window; `0` or `off`
-        // disables. Fork roles are excluded for now: a golden's RAM file is
-        // the shared CoW image (releasing its pages needs hole-punch
-        // semantics, and a frozen golden cannot answer balloon requests), and
-        // a clone's private mapping reverts to golden bytes on discard —
-        // spec-legal for reported-free pages but unvalidated, so clones wait
-        // until that path is exercised.
-        let fork_role = std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
-            || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some();
-        if let (Some(ctl), Some(idle_min), false) =
-            (ctl_path.clone(), idle_reclaim_minutes(), fork_role)
-        {
+        // disables. A branch source is excluded because its RAM is the stable
+        // image for later descendants (and it may be frozen at a branchpoint).
+        // A non-branchable leaf is safe: its MAP_PRIVATE pages are disposable
+        // once the guest balloon surrenders them, while the shared generation
+        // remains unchanged for its source and siblings.
+        let reclaim_role = idle_reclaim_role(
+            std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1"),
+            std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
+        );
+        if let (Some(ctl), Some(idle_min), true) = (
+            ctl_path.clone(),
+            idle_reclaim_minutes(),
+            reclaim_role.can_reclaim(),
+        ) {
             spawn_idle_reclaim(ctl, resources.memory_mib, idle_min);
         }
 
         // Fork clone: boot from a snapshot dir (CoW-map a golden VM's RAM +
         // restore state) instead of cold-booting, when SMOLVM_SNAPSHOT_DIR is set.
+        #[cfg(target_os = "linux")]
+        if let Some(raw) = std::env::var_os("SMOLVM_READONLY_RESTORE_FD") {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            std::env::remove_var("SMOLVM_READONLY_RESTORE_FD");
+            let fd: i32 = try_or_free_ctx!(
+                raw.to_string_lossy().parse(),
+                "restore RAM",
+                "invalid input descriptor"
+            );
+            if fd < 3 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent("restore RAM", "invalid input descriptor"));
+            }
+            let input = OwnedFd::from_raw_fd(fd);
+            // This descriptor comes from open_readonly_memory: verified
+            // service-owned input beneath a private directory, never a guest
+            // writable file. Its bytes remain immutable; cleanup only unlinks
+            // names, while libkrun and descendants retain their descriptors.
+            let (result, backend) = if let Some(set_memory) = krun.set_snapshot_memory_fd2 {
+                const IMMUTABLE: u32 = 1;
+                (
+                    set_memory(ctx, input.as_raw_fd(), IMMUTABLE),
+                    "immutable-file",
+                )
+            } else {
+                let set_memory = try_or_free_ctx!(
+                    krun.set_snapshot_memory_fd.ok_or(()),
+                    "restore RAM",
+                    "libkrun lacks read-only snapshot memory support"
+                );
+                (set_memory(ctx, input.as_raw_fd()), "private-copy")
+            };
+            if result < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "restore RAM",
+                    format!("libkrun rejected read-only input: {result}"),
+                ));
+            }
+            tracing::info!(backend, "configured checkpoint RAM backing");
+        }
         if let Ok(snap_dir) = std::env::var("SMOLVM_SNAPSHOT_DIR") {
             if !snap_dir.is_empty() {
                 match krun.set_snapshot {
@@ -1615,18 +1838,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // host page-cache pages into the guest), which is the transport
             // for CLONE rings — clone guest RAM is COW-private, but the DAX
             // window is device memory, re-established per-VM, so it dodges
-            // the COW wall entirely. libkrun supports per-device windows
-            // (ShmManager::create_fs_region per fs index); the old code just
-            // never asked (shm_size=0 here while launcher_dynamic asked for
-            // 2 GiB — the source of the "only root has DAX" misdiagnosis).
-            let is_ring_mount = mount.target == std::path::Path::new("/opt/smolvm-ring");
-            let dax_window: u64 = match std::env::var("SMOLVM_MOUNT_DAX").as_deref() {
-                Ok("1") => 1 << 29,
-                // The implicit CUDA ring mount ALWAYS gets a window — it exists
-                // solely to be dax-mmap'd (512 MB, the proven window size).
-                _ if is_ring_mount => 1 << 29,
-                _ => 0,
-            };
+            // the COW wall entirely. The shared policy keeps this launcher,
+            // packed VMs, and the direct backend on the same window size.
+            let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
             // Read-only mounts must be enforced host-side by the virtiofs
             // device (krun_add_virtiofs3's read_only flag), not only by the
             // guest's bind-remount: a root process in the guest can undo a
@@ -1642,18 +1856,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             "read-only mounts require libkrun with krun_add_virtiofs3",
                         ));
                     }
-                    // DAX requested but symbol missing: fall back to plain.
-                    if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
-                        krun_free_ctx(ctx);
-                        return Err(Error::agent(
-                            "add virtiofs mount",
-                            format!(
-                                "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
-                                mount.source.display()
-                            ),
-                        ));
-                    }
-                    continue;
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        "DAX mounts require libkrun with krun_add_virtiofs3",
+                    ));
                 };
                 if add_virtiofs3(
                     ctx,
@@ -1671,6 +1878,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             mount.source.display()
                         ),
                     ));
+                }
+                if dax_window > 0 {
+                    tracing::info!(
+                        tag = %mount_tag,
+                        dax_window_mib = dax_window >> 20,
+                        "virtiofs DAX enabled"
+                    );
                 }
             } else if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
@@ -1691,11 +1905,49 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             if layers_dir.exists() {
                 let tag = cstr("smolvm_layers");
                 let host_path = path_to_cstring(layers_dir)?;
-                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                // Layers the host extracted itself carry their ownership in the
+                // override xattr; the Linux server presents it only when asked.
+                let override_stat = cfg!(target_os = "linux")
+                    && layers_dir
+                        .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
+                        .is_file();
+                let added = if override_stat {
+                    let Some(add_virtiofs4) = krun.add_virtiofs4 else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add packed layers virtiofs",
+                            "host-extracted layers require libkrun with krun_add_virtiofs4",
+                        ));
+                    };
+                    add_virtiofs4(
+                        ctx,
+                        tag.as_ptr(),
+                        host_path.as_ptr(),
+                        super::virtiofs::packed_layers_dax_window(),
+                        false,
+                        super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
+                    )
+                } else {
+                    let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add packed layers virtiofs",
+                            "packed-layer DAX requires libkrun with krun_add_virtiofs3",
+                        ));
+                    };
+                    add_virtiofs3(
+                        ctx,
+                        tag.as_ptr(),
+                        host_path.as_ptr(),
+                        super::virtiofs::packed_layers_dax_window(),
+                        false,
+                    )
+                };
+                if added < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "add packed layers virtiofs",
-                        "krun_add_virtiofs failed for packed layers",
+                        "krun_add_virtiofs3 failed for packed layers",
                     ));
                 }
             } else {
@@ -1791,14 +2043,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {
-            let mount_tag = HostMount::mount_tag(i);
-            let ro_flag = if mount.read_only { "ro" } else { "rw" };
+            let mount_tag = mount.runtime_mount_tag(i);
+            let mode = if mount.staged {
+                "staged"
+            } else if mount.read_only {
+                "ro"
+            } else {
+                "rw"
+            };
             let env_val = format!(
                 "SMOLVM_MOUNT_{}={}:{}:{}",
                 i,
                 mount_tag,
                 mount.target.display(),
-                ro_flag
+                mode
             );
             if let Ok(cstr) = CString::new(env_val) {
                 env_strings.push(cstr);
@@ -1996,7 +2254,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         return None;
                     }
                     Some(
-                        buf.chunks_exact(3)
+                        buf.as_chunks::<3>()
+                            .0
+                            .iter()
                             .map(|c| (c[0], c[1], c[2]))
                             .collect::<Vec<_>>(),
                     )
@@ -2006,9 +2266,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Async disks create a permanently restricted, fixed-file io_uring
+        // during the configuration calls above.  Apply seccomp only now, with
+        // TSYNC, so ring creation remains denied to a compromised running VMM.
+        if let Err(error) = crate::process::install_configured_seccomp_filter(
+            resources.block_io == crate::data::resources::BlockIoEngine::Async,
+        ) {
+            krun_free_ctx(ctx);
+            return Err(Error::agent(
+                "install seccomp filter",
+                format!("refusing to boot unconfined: {error}"),
+            ));
+        }
+
         // Start VM (this replaces the process on success)
         boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);
+        let start_error_detail = krun.last_error_message();
 
         // If we get here, something went wrong — free the context before returning
         krun_free_ctx(ctx);
@@ -2017,7 +2291,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         drop(netns_bridge);
         Err(Error::agent(
             "start vm",
-            super::launcher_dynamic::describe_krun_start_error(ret),
+            super::launcher_dynamic::describe_krun_start_error_with_detail(
+                ret,
+                start_error_detail.as_deref(),
+            ),
         ))
     }
 }
@@ -2031,17 +2308,6 @@ fn cstr(s: &str) -> CString {
 fn path_to_cstring(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
-}
-
-fn rootfs_dax_disabled() -> bool {
-    std::env::var(ENV_SMOLVM_ROOTFS_DAX)
-        .map(|value| {
-            matches!(
-                value.as_str(),
-                "0" | "false" | "False" | "FALSE" | "no" | "off"
-            )
-        })
-        .unwrap_or(false)
 }
 
 // Unix-only: virtio-net is the sole caller and is itself unix-gated.
@@ -2161,6 +2427,36 @@ fn raise_fd_limits() {
 /// pulsed once, not continuously. Host-side release additionally needs
 /// SMOLVM_BALLOON_RECLAIM=1 (macOS stage-2 unmap reclaim).
 pub(crate) const IDLE_RECLAIM_DEFAULT_MINUTES: u64 = 10;
+const IDLE_RECLAIM_RSS_REARM_GROWTH: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleReclaimRole {
+    Ordinary,
+    BranchLeaf,
+    BranchSource,
+}
+
+impl IdleReclaimRole {
+    fn can_reclaim(self) -> bool {
+        matches!(self, Self::Ordinary | Self::BranchLeaf)
+    }
+}
+
+fn idle_reclaim_role(branchable: bool, restored_branch: bool) -> IdleReclaimRole {
+    if branchable {
+        IdleReclaimRole::BranchSource
+    } else if restored_branch {
+        IdleReclaimRole::BranchLeaf
+    } else {
+        IdleReclaimRole::Ordinary
+    }
+}
+
+fn idle_reclaim_rss_refilled(baseline: Option<u64>, current: Option<u64>) -> bool {
+    baseline.zip(current).is_some_and(|(baseline, current)| {
+        current.saturating_sub(baseline) >= IDLE_RECLAIM_RSS_REARM_GROWTH
+    })
+}
 
 /// The effective idle-reclaim window: `None` = disabled (`SMOLVM_IDLE_RECLAIM`
 /// set to `0`/`off`), otherwise the configured or default minutes.
@@ -2182,8 +2478,91 @@ pub(crate) fn idle_reclaim_minutes() -> Option<u64> {
     }
 }
 
+use std::time::Duration;
+
+type AddDisk2 =
+    unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32;
+type AddDisk4 = unsafe extern "C" fn(
+    u32,
+    *const libc::c_char,
+    *const libc::c_char,
+    u32,
+    bool,
+    bool,
+    u32,
+    u32,
+) -> i32;
+
+const KRUN_SYNC_FULL: u32 = 2;
+const KRUN_BLOCK_IO_ASYNC: u32 = 1;
+const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
+
+struct BlockDisk {
+    ctx: u32,
+    block_id: *const libc::c_char,
+    disk_path: *const libc::c_char,
+    disk_format: u32,
+    read_only: bool,
+}
+
+/// Add a writable block disk with the requested host engine.
+unsafe fn add_block_disk(
+    disk: BlockDisk,
+    engine: crate::data::resources::BlockIoEngine,
+    add_disk2: AddDisk2,
+    add_disk4: Option<AddDisk4>,
+) -> i32 {
+    use crate::data::resources::BlockIoEngine;
+    if engine == BlockIoEngine::Async {
+        let Some(add_disk4) = add_disk4 else {
+            return KRUN_ADD_DISK4_MISSING;
+        };
+        // Buffered disk, full guest flush semantics, restricted io_uring engine.
+        return unsafe {
+            add_disk4(
+                disk.ctx,
+                disk.block_id,
+                disk.disk_path,
+                disk.disk_format,
+                disk.read_only,
+                false,
+                KRUN_SYNC_FULL,
+                KRUN_BLOCK_IO_ASYNC,
+            )
+        };
+    }
+    unsafe {
+        add_disk2(
+            disk.ctx,
+            disk.block_id,
+            disk.disk_path,
+            disk.disk_format,
+            disk.read_only,
+        )
+    }
+}
+
+fn block_io_error(
+    disk: &str,
+    engine: crate::data::resources::BlockIoEngine,
+    result: i32,
+) -> String {
+    if engine == crate::data::resources::BlockIoEngine::Async && result == KRUN_ADD_DISK4_MISSING {
+        return format!(
+            "async block I/O for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
+        );
+    }
+    if engine == crate::data::resources::BlockIoEngine::Async
+        && matches!(result, r if r == -libc::ENOSYS || r == -libc::EPERM || r == -libc::EACCES || r == -libc::ENOTSUP)
+    {
+        return format!(
+            "async block I/O is unavailable for {disk} on this host (io_uring error {result}); use --block-io sync"
+        );
+    }
+    format!("failed to add {disk} disk with {engine:?} block I/O (error {result})")
+}
+
 fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
-    use std::time::Duration;
     const TICK: Duration = Duration::from_secs(30);
     const IDLE_FRACTION: f64 = 0.01;
     const ACTIVE_FRACTION: f64 = 0.05;
@@ -2219,6 +2598,7 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
             let cmd = |c: &str| crate::agent::fork::control_socket_cmd(&ctl, c);
             let mut idle_ticks = 0u32;
             let mut armed = true;
+            let mut reclaimed_rss = None;
             loop {
                 std::thread::sleep(TICK);
                 let Some(now) = process_cpu() else {
@@ -2226,7 +2606,10 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                 };
                 let busy = now.saturating_sub(last).as_secs_f64() / TICK.as_secs_f64();
                 last = now;
-                if busy > ACTIVE_FRACTION {
+                let rss = crate::process::process_stats(std::process::id() as crate::process::Pid)
+                    .map(|stats| stats.rss_bytes);
+                let refilled = idle_reclaim_rss_refilled(reclaimed_rss, rss);
+                if busy > ACTIVE_FRACTION || refilled {
                     armed = true;
                 }
                 if busy > IDLE_FRACTION {
@@ -2237,12 +2620,14 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                 if !armed || idle_ticks < ticks_needed {
                     continue;
                 }
-                armed = false;
-                idle_ticks = 0;
                 tracing::info!(target_mib, "idle reclaim: balloon pulse");
-                if cmd(&format!("BALLOON {target_mib}")).is_err() {
+                let inflate = cmd(&format!("BALLOON {target_mib}"));
+                if !inflate.as_ref().is_ok_and(|reply| reply.starts_with("OK")) {
+                    tracing::warn!(reply = ?inflate, "idle reclaim: balloon inflate refused");
                     continue;
                 }
+                armed = false;
+                idle_ticks = 0;
                 // Wait for the guest to reach the target (or give up), then
                 // deflate; the durable effect is the cache eviction.
                 for _ in 0..30 {
@@ -2253,7 +2638,33 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                         Err(_) => break,
                     }
                 }
-                let _ = cmd("BALLOON 0");
+                let mut deflated = false;
+                for _ in 0..3 {
+                    match cmd("BALLOON 0") {
+                        Ok(reply) if reply.starts_with("OK") => {
+                            deflated = true;
+                            break;
+                        }
+                        reply => {
+                            tracing::warn!(reply = ?reply, "idle reclaim: balloon deflate refused");
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+                if !deflated {
+                    // The negotiated DEFLATE_ON_OOM feature keeps the guest
+                    // usable, but retain the warning so a broken control path
+                    // is observable instead of silently reducing its ceiling.
+                    tracing::error!("idle reclaim: could not restore balloon target to zero");
+                }
+                // Do not mistake the balloon worker's own CPU time for guest
+                // activity and immediately re-arm an otherwise idle machine.
+                if let Some(after) = process_cpu() {
+                    last = after;
+                }
+                reclaimed_rss =
+                    crate::process::process_stats(std::process::id() as crate::process::Pid)
+                        .map(|stats| stats.rss_bytes);
             }
         });
 }
@@ -2262,6 +2673,42 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn async_block_errors_distinguish_old_library_from_host_support() {
+        use crate::data::resources::BlockIoEngine;
+
+        assert!(
+            block_io_error("storage", BlockIoEngine::Async, KRUN_ADD_DISK4_MISSING)
+                .contains("newer bundled libkrun")
+        );
+        assert!(
+            block_io_error("storage", BlockIoEngine::Async, -libc::EPERM)
+                .contains("use --block-io sync")
+        );
+    }
+
+    #[test]
+    fn idle_reclaim_includes_leaf_branches_but_not_future_sources() {
+        assert!(idle_reclaim_role(false, false).can_reclaim());
+        assert!(idle_reclaim_role(false, true).can_reclaim());
+        assert!(!idle_reclaim_role(true, false).can_reclaim());
+        assert!(!idle_reclaim_role(true, true).can_reclaim());
+    }
+
+    #[test]
+    fn idle_reclaim_rss_growth_rearms_after_a_low_cpu_refill() {
+        let baseline = 200 * 1024 * 1024;
+        assert!(idle_reclaim_rss_refilled(
+            Some(baseline),
+            Some(baseline + IDLE_RECLAIM_RSS_REARM_GROWTH)
+        ));
+        assert!(!idle_reclaim_rss_refilled(
+            Some(baseline),
+            Some(baseline + IDLE_RECLAIM_RSS_REARM_GROWTH - 1)
+        ));
+        assert!(!idle_reclaim_rss_refilled(None, Some(u64::MAX)));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

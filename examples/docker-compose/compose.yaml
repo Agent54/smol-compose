@@ -1,0 +1,60 @@
+name: smolvm-compose-evaluation
+
+services:
+  app:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -c
+      - |
+        import http.server
+        import os
+        import socket
+        import threading
+
+        socket_path = "/run/smol-compose-evaluation/guest.sock"
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+
+        def serve_socket():
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(socket_path)
+            server.listen()
+            while True:
+                connection, _ = server.accept()
+                with connection:
+                    connection.recv(4096)
+                    connection.sendall(b"vm-to-host-ok\n")
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"port-exposure-ok\n"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        threading.Thread(target=serve_socket, daemon=True).start()
+        http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+    init: true
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /run/smol-compose-evaluation
+        target: /run/smol-compose-evaluation
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read() == b'port-exposure-ok\\n'"
+      interval: 2s
+      timeout: 3s
+      retries: 30

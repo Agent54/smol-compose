@@ -34,8 +34,8 @@ pub struct Supervisor {
     /// Per-machine instant at which a scheduled restart becomes due. Lets the
     /// supervisor honor restart backoff WITHOUT sleeping inside the shared
     /// health-check loop: a crash-looping machine with a long exponential
-    /// backoff must not stall every other machine's liveness check, gauge
-    /// reconcile, and log rotation. The supervisor is the single task that owns
+    /// backoff must not stall every other machine's liveness check or gauge
+    /// reconcile. The supervisor is the single task that owns
     /// the loop, so a plain map needs no synchronization. Entries are cleared
     /// when a machine is alive again, its restart fires, or its policy stops it.
     next_restart_at: std::collections::HashMap<String, tokio::time::Instant>,
@@ -106,13 +106,22 @@ impl Supervisor {
         let (total, running) = self.state.machine_counts();
         metrics::gauge!("smolvm_machines_running").set(running as f64);
         metrics::gauge!("smolvm_machines_total").set(total as f64);
-
-        // Also rotate logs for all machines
-        self.rotate_logs_if_needed().await;
     }
 
     /// Check a single machine and restart if needed.
     async fn check_machine(&mut self, name: &str) -> crate::Result<()> {
+        {
+            let lifecycle = self.state.lifecycle_lock(name);
+            // An API lifecycle operation may be creating or deleting the row.
+            // Let it finish, without blocking other machines' health checks.
+            let Ok(_guard) = lifecycle.try_lock() else {
+                return Ok(());
+            };
+            if self.state.forget_deleted_machine(name)? {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
+        }
         // Check if machine is alive
         let is_alive = self.state.is_machine_alive(name);
 
@@ -126,6 +135,13 @@ impl Supervisor {
         // Machine is dead — try to retrieve its exit code via waitpid
         // and persist it so the restart policy can use it.
         if let Ok(Some(record)) = self.state.db().get_vm(name) {
+            // A recovered manager can lack a child handle and its PID file
+            // can be missing while the database still identifies a live VMM.
+            // Do not erase that identity or schedule another launch.
+            if record.is_process_alive() {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
             if let Some(pid) = record.pid {
                 let exit_code = crate::process::try_wait(pid);
                 self.state.set_last_exit_code(name, exit_code);
@@ -342,38 +358,6 @@ impl Supervisor {
             }
         }
     }
-
-    /// Rotate logs for all machines if they exceed the size limit.
-    async fn rotate_logs_if_needed(&self) {
-        let machine_names = self.state.list_machine_names();
-
-        for name in machine_names {
-            if let Some(log_path) = self.get_machine_log_path(&name) {
-                if let Err(e) = crate::log_rotation::rotate_if_needed(&log_path) {
-                    tracing::debug!(machine = %name, error = %e, "failed to rotate logs");
-                }
-            }
-        }
-    }
-
-    /// Get the console log path for a machine.
-    ///
-    /// Resolves to the VM's hash-derived data directory — the canonical
-    /// layout used by `AgentManager::new_internal` and exposed via
-    /// `vm_data_dir` / the `machine data-dir` CLI command.
-    fn get_machine_log_path(&self, name: &str) -> Option<std::path::PathBuf> {
-        if crate::data::validate_vm_name(name, "machine name").is_err() {
-            tracing::warn!(machine = %name, "skipping invalid machine name when resolving log path");
-            return None;
-        }
-
-        let log_path = crate::agent::vm_data_dir(name).join("agent-console.log");
-        if log_path.exists() {
-            Some(log_path)
-        } else {
-            None
-        }
-    }
 }
 
 // Tests for should_restart and backoff_duration live in src/config.rs
@@ -385,6 +369,74 @@ mod restart_timing_tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn live_database_pid_survives_missing_manager_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let mut record = crate::config::VmRecord::new(
+            "supervisor-live-pid".into(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+        );
+        record.pid = Some(std::process::id() as i32);
+        record.state = crate::config::RecordState::Running;
+        state
+            .db()
+            .insert_vm("supervisor-live-pid", &record)
+            .unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        supervisor
+            .next_restart_at
+            .insert("supervisor-live-pid".into(), Instant::now());
+        assert!(!state.is_machine_alive("supervisor-live-pid"));
+        supervisor
+            .check_machine("supervisor-live-pid")
+            .await
+            .unwrap();
+        let kept = state.db().get_vm("supervisor-live-pid").unwrap().unwrap();
+        assert_eq!(kept.pid, record.pid);
+        assert_eq!(kept.state, record.state);
+        assert!(!supervisor
+            .next_restart_at
+            .contains_key("supervisor-live-pid"));
+    }
+
+    #[tokio::test]
+    async fn external_delete_clears_registry_and_pending_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("machines.db")).unwrap();
+        let name = "supervisor-external-delete";
+        db.insert_vm(
+            name,
+            &crate::config::VmRecord::new(name.into(), 1, 512, vec![], vec![], false),
+        )
+        .unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        state.load_persisted_machines();
+        assert!(state.get_machine(name).is_ok());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        supervisor
+            .next_restart_at
+            .insert(name.into(), Instant::now());
+        state.db().remove_vm(name).unwrap();
+        // In-flight lifecycle work must be left alone until it finishes.
+        let lock = state.lifecycle_lock(name);
+        let guard = lock.lock().await;
+        supervisor.check_machine(name).await.unwrap();
+        assert!(state.get_machine(name).is_ok());
+        drop(guard);
+        supervisor.check_machine(name).await.unwrap();
+        assert!(state.get_machine(name).is_err());
+        assert!(!supervisor.next_restart_at.contains_key(name));
+        supervisor.check_machine(name).await.unwrap();
+    }
 
     // A backoff at or below the minimum restarts immediately and schedules nothing.
     #[test]

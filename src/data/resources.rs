@@ -20,6 +20,33 @@ pub const DEFAULT_GPU_VRAM_MIB: u32 = 4096;
 
 use crate::network::NetworkBackend;
 
+/// Host engine used to service guest block-device requests.
+///
+/// Synchronous I/O is the compatibility default and has no asynchronous
+/// setup cost. The asynchronous engine is an explicit Linux optimization that
+/// overlaps queued raw-disk reads through a restricted io_uring; buffered
+/// writes stay inline.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockIoEngine {
+    /// Service one request at a time on the virtio block worker.
+    #[default]
+    Sync,
+    /// Submit queued raw-disk reads through a restricted Linux io_uring.
+    Async,
+}
+
 /// Resources available to a micro vm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmResources {
@@ -45,6 +72,12 @@ pub struct VmResources {
     /// so unmodified CUDA/PyTorch code in the guest runs on the host GPU.
     #[serde(default)]
     pub cuda: bool,
+    /// Expose the host's virtualization extensions so the guest can run KVM --
+    /// i.e. run smolvm (or any hypervisor) inside the machine. Off by default:
+    /// nesting costs a vmexit on work the guest would otherwise do natively,
+    /// and most workloads never need it.
+    #[serde(default)]
+    pub nested_virt: bool,
     /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: bool,
@@ -52,6 +85,13 @@ pub struct VmResources {
     pub storage_gib: Option<u64>,
     /// Overlay disk size in GiB (None = default 10 GiB).
     pub overlay_gib: Option<u64>,
+    /// Host block I/O engine. Defaults to the historical synchronous path.
+    #[serde(default)]
+    pub block_io: BlockIoEngine,
+    /// Host disks attached beyond the managed storage and overlay disks, in
+    /// order, surfacing as `/dev/vdc`, `/dev/vdd`, ... Empty for most machines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<crate::data::disk::AttachedDisk>,
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -82,6 +122,13 @@ impl VmResources {
     /// Validate resource values before starting a VM. Returns an error with
     /// a clear message for values that would cause an opaque hypervisor failure.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        #[cfg(not(target_os = "linux"))]
+        if self.block_io == BlockIoEngine::Async {
+            return Err(crate::Error::config(
+                "validate resources",
+                "async block I/O is currently supported on Linux hosts only; use --block-io sync",
+            ));
+        }
         if self.cpus == 0 {
             return Err(crate::Error::config(
                 "validate resources",
@@ -133,9 +180,12 @@ impl Default for VmResources {
             gpu: false,
             gpu_vram_mib: None,
             cuda: false,
+            nested_virt: false,
             rosetta: false,
             storage_gib: None,
             overlay_gib: None,
+            block_io: BlockIoEngine::Sync,
+            disks: Vec::new(),
             allowed_cidrs: None,
             dns: None,
             network_name: None,

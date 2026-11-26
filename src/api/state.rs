@@ -20,6 +20,50 @@ struct CpuSample {
     cpu_time_ns: u64,
 }
 
+/// Aggregate live host utilization for SmolVM processes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeUtilization {
+    /// Fractional CPUs consumed across running VMMs.
+    pub used_cpus: f64,
+    /// Summed resident memory in MiB.
+    pub rss_mb: u64,
+    /// Summed proportional resident memory in MiB.
+    pub pss_mb: Option<u64>,
+    /// Summed private resident memory in MiB.
+    pub private_memory_mb: Option<u64>,
+    /// Summed shared mappings in MiB (not unique physical memory).
+    pub shared_memory_mapped_mb: Option<u64>,
+    /// Physical disk blocks consumed by machine disks in GiB.
+    pub disk_gb: u64,
+}
+
+/// Records whose disk state must survive startup reconciliation. A stopped or
+/// live clone keeps every ancestor in its qcow2 lineage alive even when an
+/// ancestor VMM process died; deleting that ancestor's data directory would
+/// silently break the child's backing chain.
+fn retained_fork_lineage(vms: &[(String, VmRecord)]) -> HashSet<String> {
+    let mut retained = vms
+        .iter()
+        .filter(|(_, record)| record.pid.is_none() || record.is_process_alive())
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+
+    loop {
+        let mut changed = false;
+        for (name, record) in vms {
+            if retained.contains(name) {
+                if let Some(parent) = &record.golden {
+                    changed |= retained.insert(parent.clone());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    retained
+}
+
 /// Shared API server state.
 pub struct ApiState {
     /// Registry of machine managers by name.
@@ -72,6 +116,15 @@ pub struct ApiState {
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
+    /// Latest node-wide CUDA inventory and telemetry from the controller's
+    /// existing NVML sampler. The timestamp prevents `/capacity` from
+    /// advertising stale GPUs if the sampling loop stops making progress.
+    cuda_devices: parking_lot::Mutex<
+        Option<(
+            std::time::Instant,
+            Vec<crate::api::admission::GpuDeviceSample>,
+        )>,
+    >,
     /// Advisory wake-up for the automatic fork-pool reconciler. Durable SQLite
     /// state remains authoritative; this only removes the polling delay after a
     /// pool mutation while the periodic pass remains the recovery fallback.
@@ -82,6 +135,8 @@ pub struct ApiState {
 
 /// Internal machine entry with manager and configuration.
 pub struct MachineEntry {
+    /// Resolved workload image, matching the persisted machine record.
+    pub image: Option<String>,
     /// The agent manager for this machine.
     pub manager: AgentManager,
     /// Host mounts configured for this machine.
@@ -120,6 +175,8 @@ pub struct MachineRegistration {
     pub manager: AgentManager,
     /// Host mounts to configure.
     pub mounts: Vec<MountSpec>,
+    /// Remote volumes (`s3://`) to mount in the workload.
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
     /// Port mappings to configure.
     pub ports: Vec<PortSpec>,
     /// VM resources to configure.
@@ -128,6 +185,10 @@ pub struct MachineRegistration {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Whether ordinary starts should preserve file-backed, forkable RAM.
+    pub forkable: bool,
+    /// Whether image pull and init were already completed in captured state.
+    pub init_completed: bool,
     /// Whether to expose the guest Docker daemon socket to the host.
     pub docker_socket: bool,
     /// OCI image reference (e.g., "alpine:latest").
@@ -142,6 +203,12 @@ pub struct MachineRegistration {
     pub env: Vec<(String, String)>,
     /// Working directory (from manifest).
     pub workdir: Option<String>,
+    /// Container user captured with a live image workload.
+    pub user: Option<String>,
+    /// Persistent overlay identifier inherited by a restored image workload.
+    pub fork_overlay_owner: Option<String>,
+    /// Local UID lineage established by a portable restore.
+    pub host_uid_owner: Option<String>,
     /// Secret refs to attach to this machine (from a Smolfile or
     /// `CreateMachineRequest.secrets`).
     pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
@@ -244,6 +311,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         })
@@ -262,6 +330,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         }
@@ -271,6 +340,28 @@ impl ApiState {
     /// the atomic lease claim path.
     pub fn admission(&self) -> &crate::api::admission::AdmissionRegistry {
         &self.admission
+    }
+
+    /// Publish the latest node-wide CUDA sample. `None` clears previously
+    /// advertised devices after an NVML failure instead of leaving schedulers
+    /// with stale capacity.
+    pub(crate) fn record_cuda_devices(
+        &self,
+        devices: Option<Vec<crate::api::admission::GpuDeviceSample>>,
+    ) {
+        *self.cuda_devices.lock() = devices.map(|devices| (std::time::Instant::now(), devices));
+    }
+
+    /// Return fresh CUDA telemetry for the node capacity endpoint. The pool
+    /// controller samples every second; five seconds leaves ample scheduling
+    /// jitter while failing closed if that controller stalls or exits.
+    pub(crate) fn cuda_devices(&self) -> Option<Vec<crate::api::admission::GpuDeviceSample>> {
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+        self.cuda_devices
+            .lock()
+            .as_ref()
+            .filter(|(sampled_at, _)| sampled_at.elapsed() <= MAX_AGE)
+            .map(|(_, devices)| devices.clone())
     }
 
     /// Wake the automatic pool controller after durable pool state changes.
@@ -340,44 +431,62 @@ impl ApiState {
             }
         };
 
+        let retained_lineage = retained_fork_lineage(&vms);
         let mut loaded = Vec::new();
 
-        for (name, record) in vms {
+        for (name, mut record) in vms {
             // Only clean up machines that have a PID (were started) but whose
             // process is no longer alive.  Machines in "created" state (pid=None)
             // have never been started and must be preserved — they are valid
             // configs waiting for a start call.
             if record.pid.is_some() && !record.is_process_alive() {
-                tracing::info!(machine = %name, "cleaning up dead machine from database");
-                if let Err(e) = self.db.remove_vm(&name) {
-                    tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
-                }
-                // Reclaim the data dir too. Removing only the DB record leaks the
-                // machine's storage + overlay images (multi-GB sparse files) — and
-                // since the record is gone, nothing will ever clean them up later.
-                // On a long-lived node that churns/crashes machines this is a slow
-                // disk-fill across server restarts. The `pid.is_some()` guard above
-                // means we only touch machines that were started and then died, not
-                // intentionally-stopped (pid=None) machines whose disks must persist.
-                let dir = crate::agent::vm_data_dir(&name);
-                if dir.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&dir) {
-                        tracing::warn!(machine = %name, error = %e, "failed to remove dead machine data dir");
+                if retained_lineage.contains(&name) {
+                    tracing::warn!(
+                        machine = %name,
+                        "machine process died but a retained fork descendant still depends on its disks; preserving it as stopped"
+                    );
+                    record.pid = None;
+                    record.pid_start_time = None;
+                    record.state = RecordState::Stopped;
+                    match self.db.update_vm(&name, |stored| {
+                        stored.pid = None;
+                        stored.pid_start_time = None;
+                        stored.state = RecordState::Stopped;
+                    }) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            tracing::warn!(machine = %name, "fork ancestor disappeared during startup reconciliation");
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(machine = %name, error = %e, "failed to preserve dead fork ancestor; leaving its data untouched");
+                            continue;
+                        }
                     }
+                } else {
+                    tracing::info!(machine = %name, "cleaning up dead machine from database");
+                    if let Err(e) = self.db.remove_vm(&name) {
+                        tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
+                    }
+                    // Reclaim the data dir too. Removing only the DB record leaks the
+                    // machine's storage + overlay images (multi-GB sparse files) — and
+                    // since the record is gone, nothing will ever clean them up later.
+                    // On a long-lived node that churns/crashes machines this is a slow
+                    // disk-fill across server restarts. The `pid.is_some()` guard above
+                    // means we only touch machines that were started and then died, not
+                    // intentionally-stopped (pid=None) machines whose disks must persist.
+                    let dir = crate::agent::vm_data_dir(&name);
+                    if dir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&dir) {
+                            tracing::warn!(machine = %name, error = %e, "failed to remove dead machine data dir");
+                        }
+                    }
+                    continue;
                 }
-                continue;
             }
 
             // Convert VmRecord to MachineEntry
-            let mounts: Vec<MountSpec> = record
-                .mounts
-                .iter()
-                .map(|(source, target, readonly)| MountSpec {
-                    source: source.clone(),
-                    target: target.clone(),
-                    readonly: *readonly,
-                })
-                .collect();
+            let mounts: Vec<MountSpec> = record.host_mounts().iter().map(MountSpec::from).collect();
 
             let ports: Vec<PortSpec> = record
                 .ports
@@ -396,6 +505,7 @@ impl ApiState {
                 cuda: Some(record.cuda),
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
+                block_io: Some(record.block_io),
                 allowed_cidrs: record.allowed_cidrs.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
                 network_backend: record.network_backend,
@@ -426,6 +536,7 @@ impl ApiState {
                     machines.insert(
                         name.clone(),
                         Arc::new(parking_lot::Mutex::new(MachineEntry {
+                            image: record.image.clone(),
                             manager,
                             mounts,
                             ports,
@@ -585,6 +696,27 @@ impl ApiState {
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))
     }
 
+    /// Forget an externally deleted machine without deleting data or stopping
+    /// a process. Caller must hold the machine's lifecycle lock.
+    pub(crate) fn forget_deleted_machine(&self, name: &str) -> crate::Result<bool> {
+        if self.db.get_vm(name)?.is_some() {
+            return Ok(false);
+        }
+        let mut machines = self.machines.write();
+        let entry = machines.get(name).cloned();
+        if let Some(entry) = entry {
+            let Some(entry_guard) = entry.try_lock() else {
+                return Ok(false);
+            };
+            // A detached manager must not stop a surviving or replacement VM
+            // when its final reference is dropped.
+            entry_guard.manager.detach();
+            machines.remove(name);
+            tracing::info!(machine = name, "forgot externally deleted machine");
+        }
+        Ok(true)
+    }
+
     /// Update machine state in database (call after start/stop).
     ///
     /// Returns an error if the database write fails. Callers in API handlers
@@ -684,16 +816,22 @@ impl ApiState {
 
     /// Sample real CPU + memory + disk utilization across all running VM processes.
     ///
-    /// Returns `(used_cpus, used_memory_mb, used_disk_gb)`:
+    /// Returns CPU, RSS/PSS/private/shared memory, and used disk:
     /// - CPU is fractional CPUs (e.g., 2.5 = 2.5 CPUs of load), computed as
     ///   `Δcpu_time / Δwall_time` since the previous sample per PID. First sample
     ///   for a new PID returns 0 CPU; subsequent samples return the real rate.
     /// - Memory is the sum of resident set sizes across VM processes.
     /// - Disk is the sum of VM storage + overlay disk file sizes on disk.
-    pub fn real_utilization(&self) -> (f64, u64, u64) {
+    pub fn real_utilization(&self) -> NodeUtilization {
         let now = std::time::Instant::now();
         let mut total_cpus: f64 = 0.0;
         let mut total_rss_bytes: u64 = 0;
+        let mut total_pss_bytes: u64 = 0;
+        let mut total_private_bytes: u64 = 0;
+        let mut total_shared_mapped_bytes: u64 = 0;
+        let mut complete_pss = true;
+        let mut complete_private = true;
+        let mut complete_shared = true;
         let mut total_disk_bytes: u64 = 0;
 
         let pid_and_paths: Vec<(Option<i32>, std::path::PathBuf, std::path::PathBuf)> = {
@@ -734,6 +872,30 @@ impl ApiState {
                 continue;
             };
             total_rss_bytes = total_rss_bytes.saturating_add(stats.rss_bytes);
+            match crate::process::process_memory_stats(pid) {
+                Some(memory) => {
+                    if let Some(value) = memory.pss_bytes {
+                        total_pss_bytes = total_pss_bytes.saturating_add(value);
+                    } else {
+                        complete_pss = false;
+                    }
+                    if let Some(value) = memory.private_bytes {
+                        total_private_bytes = total_private_bytes.saturating_add(value);
+                    } else {
+                        complete_private = false;
+                    }
+                    if let Some(value) = memory.shared_mapped_bytes {
+                        total_shared_mapped_bytes = total_shared_mapped_bytes.saturating_add(value);
+                    } else {
+                        complete_shared = false;
+                    }
+                }
+                None => {
+                    complete_pss = false;
+                    complete_private = false;
+                    complete_shared = false;
+                }
+            }
 
             if let Some(prev) = samples.get(&pid).copied() {
                 let dt_ns = now.duration_since(prev.at).as_nanos() as u64;
@@ -755,11 +917,15 @@ impl ApiState {
         // as VMs come and go over the lifetime of the smolvm serve process).
         samples.retain(|pid, _| still_alive.contains(pid));
 
-        (
-            total_cpus,
-            total_rss_bytes / (1024 * 1024),
-            total_disk_bytes / (1024 * 1024 * 1024),
-        )
+        NodeUtilization {
+            used_cpus: total_cpus,
+            rss_mb: total_rss_bytes / (1024 * 1024),
+            pss_mb: complete_pss.then_some(total_pss_bytes / (1024 * 1024)),
+            private_memory_mb: complete_private.then_some(total_private_bytes / (1024 * 1024)),
+            shared_memory_mapped_mb: complete_shared
+                .then_some(total_shared_mapped_bytes / (1024 * 1024)),
+            disk_gb: total_disk_bytes / (1024 * 1024 * 1024),
+        }
     }
 
     // ========================================================================
@@ -853,22 +1019,28 @@ impl ApiState {
         reg: MachineRegistration,
     ) -> Result<(), ApiError> {
         // Persist to database (with conflict detection)
+        let host_mounts = reg
+            .mounts
+            .iter()
+            .map(HostMount::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        let (mounts, staged_mounts) = HostMount::split_storage_tuples(&host_mounts);
         let mut record = VmRecord::new_with_restart(
             name.clone(),
             reg.resources.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
             reg.resources
                 .memory_mb
                 .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
-            reg.mounts
-                .iter()
-                .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
-                .collect(),
+            mounts,
             reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
             reg.network,
             reg.restart.clone(),
         );
+        record.staged_mounts = staged_mounts;
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
+        record.block_io = reg.resources.block_io.unwrap_or_default();
         // Persist egress policy + backend selection from the request (previously
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
@@ -878,6 +1050,8 @@ impl ApiState {
         // silently lost CUDA/GPU on restart).
         record.gpu = reg.resources.gpu;
         record.cuda = reg.resources.cuda.unwrap_or(false);
+        record.forkable = reg.forkable;
+        record.init_completed = reg.init_completed;
         record.docker_socket = reg.docker_socket;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
@@ -885,7 +1059,14 @@ impl ApiState {
         record.cmd = reg.cmd;
         record.env = reg.env;
         record.workdir = reg.workdir;
+        record.user = reg.user;
+        record.fork_overlay_owner = reg.fork_overlay_owner;
+        record.host_uid_owner = reg.host_uid_owner;
         record.secret_refs = reg.secret_refs.clone();
+        record.remote_volumes = reg.remote_volumes.clone();
+        record
+            .validate_remote_volumes()
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         // A registry image with no network can never be pulled (the guest runs
         // the pull), so reject with a 400 here instead of persisting a machine
@@ -912,6 +1093,7 @@ impl ApiState {
                 machines.insert(
                     name,
                     Arc::new(parking_lot::Mutex::new(MachineEntry {
+                        image: record.image.clone(),
                         manager: reg.manager,
                         mounts: reg.mounts,
                         ports: reg.ports,
@@ -920,7 +1102,7 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
-                        forkable: false,
+                        forkable: reg.forkable,
                         cuda_fork_pool_size: None,
                         cuda_vram_limit_mib: None,
                         forkpoint_held: false,
@@ -1271,15 +1453,7 @@ pub async fn ensure_running_and_persist(
     // one, ensure_machine_running early-returns before the config matters.
     if let Ok(Some(record)) = state.lookup_vm(name).await {
         let mut e = entry.lock();
-        e.mounts = record
-            .mounts
-            .iter()
-            .map(|(source, target, readonly)| MountSpec {
-                source: source.clone(),
-                target: target.clone(),
-                readonly: *readonly,
-            })
-            .collect();
+        e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
         e.ports = record
             .ports
             .iter()
@@ -1361,6 +1535,10 @@ async fn relaunch_image_workload(
         crate::api::handlers::record_secret_refs_env(entry)
             .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
     ));
+    // Remote volumes mount inside the workload container; build the mount script
+    // here and let the agent run it ahead of the image-resolved command, so a
+    // service image's own entrypoint is preserved rather than clobbered.
+    let s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, &env);
     let workdir = record.workdir.clone();
     let user = record.user.clone();
     let mounts_config = {
@@ -1371,7 +1549,11 @@ async fn relaunch_image_workload(
             .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
             .collect::<Vec<_>>()
     };
-    let overlay_id = crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
+    let overlay_id = crate::workload::persistent_overlay_owner_with_lineage(
+        name,
+        record.golden.as_deref(),
+        record.fork_overlay_owner.as_deref(),
+    );
 
     let image_pull = image.clone();
     with_machine_client_traced(entry, None, move |c| {
@@ -1389,7 +1571,8 @@ async fn relaunch_image_workload(
             .with_workdir(workdir)
             .with_user(user)
             .with_mounts(mounts_config)
-            .with_persistent_overlay(Some(overlay_id));
+            .with_persistent_overlay(Some(overlay_id))
+            .with_s3_volumes(s3_volumes);
         c.run_container_detached(config).map(|_| ())
     })
     .await
@@ -1409,6 +1592,12 @@ impl TryFrom<&MountSpec> for HostMount {
     /// allows relative host paths that are canonicalized against the current
     /// working directory.
     fn try_from(spec: &MountSpec) -> Result<Self, Self::Error> {
+        if spec.readonly && spec.staged {
+            return Err(crate::Error::mount(
+                "validate mount mode",
+                "a mount cannot be both readonly and staged",
+            ));
+        }
         let source = Path::new(&spec.source);
         if !source.is_absolute() {
             return Err(crate::Error::mount(
@@ -1417,7 +1606,9 @@ impl TryFrom<&MountSpec> for HostMount {
             ));
         }
 
-        HostMount::new(&spec.source, &spec.target, spec.readonly)
+        let mut mount = HostMount::new(&spec.source, &spec.target, spec.readonly)?;
+        mount.staged = spec.staged;
+        Ok(mount)
     }
 }
 
@@ -1427,6 +1618,7 @@ impl From<&HostMount> for MountSpec {
             source: mount.source.to_string_lossy().to_string(),
             target: mount.target.to_string_lossy().to_string(),
             readonly: mount.read_only,
+            staged: mount.staged,
         }
     }
 }
@@ -1469,9 +1661,12 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // needs to expose it.
         gpu_vram_mib: None,
         cuda: spec.cuda.unwrap_or(false),
+        nested_virt: false,
         rosetta: false,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
+        block_io: spec.block_io.unwrap_or_default(),
+        disks: Vec::new(),
         allowed_cidrs: spec.allowed_cidrs.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
@@ -1490,6 +1685,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         cuda: Some(res.cuda),
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
+        block_io: Some(res.block_io),
         allowed_cidrs: res.allowed_cidrs,
         // VmResources has no hostname allow-list; callers that need it graft it
         // back from the source record (see the MachineEntry reload path).
@@ -1535,12 +1731,17 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     let cpu_seconds = stats.map(|s| s.cpu_time_ns / 1_000_000_000);
     let cpu_millis = stats.map(|s| s.cpu_time_ns / 1_000_000);
     let rss_mb = stats.map(|s| s.rss_bytes / (1024 * 1024));
+    let memory_stats = entry
+        .manager
+        .child_pid()
+        .and_then(crate::process::process_memory_stats);
     // Actual used disk (sparse-image blocks) — a gauge the control integrates for
     // active-disk billing. Independent of whether there's a live VMM process.
     let disk_used_mb = crate::agent::disk_used_mb(&name);
 
     MachineInfo {
         name,
+        image: entry.image.clone(),
         state: state.to_string(),
         cpus: entry.resources.cpus.unwrap_or(1),
         mem: entry.resources.memory_mb.unwrap_or(512),
@@ -1554,23 +1755,42 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
                 source: m.source.clone(),
                 target: m.target.clone(),
                 readonly: m.readonly,
+                staged: m.staged,
             })
             .collect(),
         ports: entry.ports.clone(),
         network: entry.network,
+        gpu: entry.resources.gpu.unwrap_or(false),
+        cuda: entry.resources.cuda.unwrap_or(false),
         network_backend: entry.resources.network_backend,
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
         allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        block_io: entry.resources.block_io.unwrap_or_default(),
+        branchable: entry.forkable,
         forkable: entry.forkable,
+        // MachineEntry is an in-memory runtime view and does not retain the
+        // persisted parent relationship; database-backed responses include it.
+        parent_machine: None,
+        cuda_branch_pool_size: entry.cuda_fork_pool_size,
         cuda_fork_pool_size: entry.cuda_fork_pool_size,
         cuda_vram_limit_mib: entry.cuda_vram_limit_mib,
+        branchpoint_held: entry.forkpoint_held,
         forkpoint_held: entry.forkpoint_held,
         egress_bytes,
         cpu_seconds,
         cpu_millis,
         rss_mb,
+        pss_mb: memory_stats
+            .and_then(|s| s.pss_bytes)
+            .map(|v| v / (1024 * 1024)),
+        private_memory_mb: memory_stats
+            .and_then(|s| s.private_bytes)
+            .map(|v| v / (1024 * 1024)),
+        shared_memory_mapped_mb: memory_stats
+            .and_then(|s| s.shared_mapped_bytes)
+            .map(|v| v / (1024 * 1024)),
         disk_used_mb,
         created_at: 0,
     }
@@ -1603,12 +1823,32 @@ mod tests {
     }
 
     #[test]
+    fn stale_cuda_inventory_fails_closed() {
+        let (_dir, state) = temp_api_state();
+        state.record_cuda_devices(Some(vec![crate::api::admission::GpuDeviceSample {
+            device_ordinal: 0,
+            uuid: "GPU-test".into(),
+            name: "test".into(),
+            utilization_percent: 0.0,
+            used_memory_mib: 0,
+            free_memory_mib: 80_000,
+            total_memory_mib: 80_000,
+        }]));
+        assert_eq!(state.cuda_devices().unwrap().len(), 1);
+
+        state.cuda_devices.lock().as_mut().unwrap().0 =
+            std::time::Instant::now() - std::time::Duration::from_secs(6);
+        assert!(state.cuda_devices().is_none());
+    }
+
+    #[test]
     fn test_type_conversions() {
         // MountSpec -> HostMount preserves readonly flag (use /tmp which exists)
         let spec = MountSpec {
             source: "/tmp".into(),
             target: "/guest".into(),
             readonly: true,
+            staged: false,
         };
         assert!(HostMount::try_from(&spec).unwrap().read_only);
 
@@ -1616,8 +1856,19 @@ mod tests {
             source: "/tmp".into(),
             target: "/guest".into(),
             readonly: false,
+            staged: false,
         };
         assert!(!HostMount::try_from(&spec).unwrap().read_only);
+
+        // The trusted system-mount escape hatch is local-CLI-only. An HTTP
+        // caller cannot turn a read-only flag into access to the server host.
+        let system_spec = MountSpec {
+            source: "/etc".into(),
+            target: "/host/etc".into(),
+            readonly: true,
+            staged: false,
+        };
+        assert!(HostMount::try_from(&system_spec).is_err());
 
         // ResourceSpec with None uses defaults
         let spec = ResourceSpec {
@@ -1628,6 +1879,7 @@ mod tests {
             cuda: None,
             storage_gb: None,
             overlay_gb: None,
+            block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
             network_backend: None,
@@ -1668,6 +1920,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn externally_deleted_machine_is_forgotten_without_deleting_replacements() {
+        let (_dir, state) = temp_api_state();
+        let name = "external-delete-qa";
+        let record = VmRecord::new(name.into(), 1, 512, vec![], vec![], false);
+        state.db.insert_vm(name, &record).unwrap();
+        state.insert_machine(
+            name,
+            MachineEntry {
+                manager: AgentManager::for_vm(name).unwrap(),
+                image: None,
+                mounts: vec![],
+                ports: vec![],
+                resources: ResourceSpec {
+                    cpus: None,
+                    memory_mb: None,
+                    network: None,
+                    gpu: None,
+                    cuda: None,
+                    storage_gb: None,
+                    overlay_gb: None,
+                    block_io: None,
+                    allowed_cidrs: None,
+                    allowed_hosts: None,
+                    network_backend: None,
+                },
+                restart: RestartConfig::default(),
+                network: false,
+                secret_refs: Default::default(),
+                source_smolmachine: None,
+                forkable: false,
+                cuda_fork_pool_size: None,
+                cuda_vram_limit_mib: None,
+                forkpoint_held: false,
+            },
+        );
+        assert!(!state.forget_deleted_machine(name).unwrap());
+        state.db.remove_vm(name).unwrap();
+        let entry = state.get_machine(name).unwrap();
+        let busy = entry.lock();
+        assert!(!state.forget_deleted_machine(name).unwrap());
+        drop(busy);
+        // A same-name replacement in the DB must survive reconciliation.
+        state.db.insert_vm(name, &record).unwrap();
+        assert!(!state.forget_deleted_machine(name).unwrap());
+        assert!(state.db.get_vm(name).unwrap().is_some());
+        state.db.remove_vm(name).unwrap();
+        assert!(state.forget_deleted_machine(name).unwrap());
+        assert!(state.get_machine(name).is_err());
+        assert!(entry.lock().manager.is_detached());
+        assert!(state.forget_deleted_machine(name).unwrap());
+    }
+
     // remove_machine must clear BOTH the DB row and the in-memory registry entry
     // even though it no longer holds the registry write lock across the DB delete
     // (the reorder that keeps `/health` from wedging under delete churn).
@@ -1683,6 +1988,7 @@ mod tests {
             "remove-test-m1",
             MachineEntry {
                 manager,
+                image: None,
                 mounts: vec![],
                 ports: vec![],
                 resources: ResourceSpec {
@@ -1693,6 +1999,7 @@ mod tests {
                     cuda: None,
                     storage_gb: None,
                     overlay_gb: None,
+                    block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     network_backend: None,
@@ -1750,6 +2057,7 @@ mod tests {
             "busy-m1",
             MachineEntry {
                 manager,
+                image: None,
                 mounts: vec![],
                 ports: vec![],
                 resources: ResourceSpec {
@@ -1760,6 +2068,7 @@ mod tests {
                     cuda: None,
                     storage_gb: None,
                     overlay_gb: None,
+                    block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     network_backend: None,
@@ -1838,6 +2147,52 @@ mod tests {
         // Name should be available for reuse
         let token = SmolvmDb::create_reservation_token();
         assert!(state.reserve_machine_name("dead-machine", &token).is_ok());
+    }
+
+    #[test]
+    fn test_load_preserves_dead_ancestor_of_retained_clone() {
+        let (_dir, state) = temp_api_state();
+
+        let mut base = VmRecord::new("dead-base".into(), 1, 512, vec![], vec![], false);
+        base.pid = Some(i32::MAX);
+        base.state = RecordState::Running;
+        state.db.insert_vm("dead-base", &base).unwrap();
+        let base_dir = crate::agent::vm_data_dir("dead-base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(base_dir.join("storage.raw"), b"base").unwrap();
+
+        let mut child = VmRecord::new("retained-child".into(), 1, 512, vec![], vec![], false);
+        child.golden = Some("dead-base".to_string());
+        child.state = RecordState::Stopped;
+        state.db.insert_vm("retained-child", &child).unwrap();
+
+        let loaded = state.load_persisted_machines();
+        let preserved = state.db.get_vm("dead-base").unwrap().unwrap();
+        assert_eq!(preserved.state, RecordState::Stopped);
+        assert_eq!(preserved.pid, None);
+        assert_eq!(preserved.pid_start_time, None);
+        assert!(base_dir.join("storage.raw").is_file());
+        assert!(loaded.contains(&"dead-base".to_string()));
+        assert!(loaded.contains(&"retained-child".to_string()));
+    }
+
+    #[test]
+    fn test_load_removes_fully_dead_fork_lineage() {
+        let (_dir, state) = temp_api_state();
+        let mut base = VmRecord::new("dead-tree-base".into(), 1, 512, vec![], vec![], false);
+        base.pid = Some(i32::MAX);
+        base.state = RecordState::Running;
+        state.db.insert_vm("dead-tree-base", &base).unwrap();
+        let mut child = VmRecord::new("dead-tree-child".into(), 1, 512, vec![], vec![], false);
+        child.pid = Some(i32::MAX - 1);
+        child.state = RecordState::Running;
+        child.golden = Some("dead-tree-base".to_string());
+        state.db.insert_vm("dead-tree-child", &child).unwrap();
+
+        state.load_persisted_machines();
+
+        assert!(state.db.get_vm("dead-tree-base").unwrap().is_none());
+        assert!(state.db.get_vm("dead-tree-child").unwrap().is_none());
     }
 
     #[test]

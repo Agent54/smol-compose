@@ -53,6 +53,18 @@ pub fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
     }
 }
 
+// Whiteout payloads are filenames, not paths. `.wh..` and `.wh...` must
+// never turn the layer directory or its parent into a deletion target.
+fn whiteout_path(parent: &Path, removed: &str) -> std::io::Result<PathBuf> {
+    if removed.is_empty() || matches!(removed, "." | "..") || removed.contains(['/', '\\', '\0']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "whiteout target must be a single filename",
+        ));
+    }
+    Ok(parent.join(removed))
+}
+
 /// Join `rel` under `base`, returning `None` if any component would escape the
 /// base — lexically (`..`, an absolute path, a Windows-style prefix) **or**
 /// through a symlink already on disk.
@@ -190,7 +202,7 @@ pub fn decompress_layer_reader<'a>(
         Ok(Box::new(flate2::read::MultiGzDecoder::new(stream)))
     } else if n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
         // Pure-Rust zstd decoder — the C `zstd` crate can't link against musl.
-        let dec = ruzstd::StreamingDecoder::new(stream)
+        let dec = ruzstd::decoding::StreamingDecoder::new(stream)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(Box::new(dec))
     } else {
@@ -233,6 +245,19 @@ fn pack_sidecar_sentinel(path: &Path) -> Option<&'static str> {
 /// whiteout translation only takes effect on Linux; on other hosts the markers
 /// would surface as `Unsupported` errors, so this is called on the Linux node.
 pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()> {
+    extract_oci_layer_with_size(reader, dest).map(|_| ())
+}
+
+/// Extract one OCI layer and return the logical bytes carried by regular file
+/// entries. Computing this while tar headers are already in hand avoids a full
+/// post-extraction directory walk, which is especially costly inside a VM for
+/// package-heavy images containing hundreds of thousands of files.
+pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    use std::collections::{HashMap, HashSet};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     // Layers arrive gzip- or zstd-compressed (or, rarely, plain). Decompress
     // transparently so a zstd layer no longer breaks extraction.
     let reader = decompress_layer_reader(reader)?;
@@ -245,9 +270,21 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
     archive.set_preserve_ownerships(true);
     archive.set_overwrite(true);
 
+    // A layer can declare a read-only directory before its children. Relax each
+    // such parent at most once, then restore its declared mode after extraction.
+    // The old path chmodded the parent for every tar entry, which turned images
+    // with large package trees into hundreds of thousands of redundant metadata
+    // writes and also left restrictive directory modes changed to 0755.
+    #[cfg(unix)]
+    let mut checked_parents = HashSet::<PathBuf>::new();
+    #[cfg(unix)]
+    let mut relaxed_parents = HashMap::<PathBuf, u32>::new();
+    let mut logical_bytes = 0u64;
+
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+        let entry_type = entry.header().entry_type();
 
         // A smolmachine PACK blob is not an OCI filesystem layer: it is a
         // .smolmachine sidecar carrying agent-rootfs.tar and a multi-GiB non-sparse
@@ -282,8 +319,9 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
                 }
                 LayerEntry::Whiteout(removed) => {
                     if let Some(parent) = full_path.parent() {
+                        let target = whiteout_path(parent, removed)?;
                         std::fs::create_dir_all(parent)?;
-                        create_overlay_whiteout(&parent.join(removed))?;
+                        create_overlay_whiteout(&target)?;
                     }
                     continue;
                 }
@@ -306,12 +344,24 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
         // on the macOS/Windows host builds of the main engine.
         #[cfg(unix)]
         if let Some(parent) = full_path.parent() {
-            use std::os::unix::fs::PermissionsExt;
-            if parent.is_dir() {
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+            let parent = parent.to_path_buf();
+            if checked_parents.insert(parent.clone()) {
+                if let Ok(metadata) = std::fs::symlink_metadata(&parent) {
+                    if metadata.is_dir() {
+                        let mode = metadata.permissions().mode();
+                        if mode & 0o300 != 0o300 {
+                            std::fs::set_permissions(
+                                &parent,
+                                std::fs::Permissions::from_mode(mode | 0o700),
+                            )?;
+                            relaxed_parents.insert(parent, mode);
+                        }
+                    }
+                }
             }
         }
 
+        let entry_size = entry.header().size().unwrap_or(0);
         if let Err(e) = entry.unpack_in(dest) {
             // Regular files and directories failing is a real error; non-regular
             // entries (symlinks, device nodes, fifos) can fail benignly — skip.
@@ -329,14 +379,80 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
                     warn!(path = %path.display(), error = %e, "skipping non-regular layer entry");
                 }
             }
+        } else if matches!(
+            entry_type,
+            tar::EntryType::Regular | tar::EntryType::GNUSparse | tar::EntryType::Continuous
+        ) {
+            logical_bytes = logical_bytes.saturating_add(entry_size);
+        }
+
+        // A repeated directory entry may reset its own mode. Forget any earlier
+        // relaxation so later children re-check the newly declared permissions.
+        #[cfg(unix)]
+        if entry_type == tar::EntryType::Directory {
+            checked_parents.remove(&full_path);
+            relaxed_parents.remove(&full_path);
         }
     }
-    Ok(())
+
+    #[cfg(unix)]
+    {
+        let mut relaxed: Vec<_> = relaxed_parents.into_iter().collect();
+        relaxed.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+        for (path, mode) in relaxed {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(logical_bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_whiteouts_cannot_delete_a_directory_or_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layer = temporary.path().join("layer");
+        std::fs::create_dir(&layer).unwrap();
+        let sentinel = temporary.path().join("keep");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        for marker in [".wh..", ".wh..."] {
+            let LayerEntry::Whiteout(removed) = classify_layer_entry(marker) else {
+                panic!("expected marker")
+            };
+            assert!(whiteout_path(&layer, removed).is_err());
+        }
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(
+            whiteout_path(&layer, "ordinary").unwrap(),
+            layer.join("ordinary")
+        );
+    }
+
+    #[test]
+    fn extraction_rejects_parent_whiteout_before_any_deletion() {
+        for name in [".wh..", ".wh..."] {
+            let temporary = tempfile::tempdir().unwrap();
+            let layer = temporary.path().join("layer");
+            std::fs::create_dir(&layer).unwrap();
+            let sentinel = temporary.path().join("keep");
+            std::fs::write(&sentinel, b"keep").unwrap();
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, std::io::empty())
+                .unwrap();
+            let data = archive.into_inner().unwrap();
+            let error = extract_oci_layer(data.as_slice(), &layer).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+            assert!(layer.is_dir());
+        }
+    }
 
     #[test]
     fn classify_recognizes_markers_and_normals() {
@@ -466,5 +582,85 @@ mod tests {
                 .collect();
             assert_eq!(names, vec!["hello".to_string()], "{label} entry list");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_restores_restrictive_directory_modes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(tmp.path()).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_size(0);
+        directory.set_mode(0o555);
+        directory.set_uid(owner.uid() as u64);
+        directory.set_gid(owner.gid() as u64);
+        directory.set_cksum();
+        builder
+            .append_data(&mut directory, "readonly", std::io::empty())
+            .unwrap();
+
+        let payload = b"still extracted";
+        let mut file = tar::Header::new_gnu();
+        file.set_size(payload.len() as u64);
+        file.set_mode(0o644);
+        file.set_uid(owner.uid() as u64);
+        file.set_gid(owner.gid() as u64);
+        file.set_cksum();
+        builder
+            .append_data(&mut file, "readonly/file", &payload[..])
+            .unwrap();
+
+        let layer = builder.into_inner().unwrap();
+        let destination = tmp.path().join("layer");
+        std::fs::create_dir(&destination).unwrap();
+        extract_oci_layer(&layer[..], &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("readonly/file")).unwrap(),
+            payload
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("readonly"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_reports_regular_file_bytes_without_a_directory_walk() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(tmp.path()).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, payload) in [("one", &b"123"[..]), ("nested/two", &b"45678"[..])] {
+            let mut file = tar::Header::new_gnu();
+            file.set_size(payload.len() as u64);
+            file.set_mode(0o644);
+            file.set_uid(owner.uid() as u64);
+            file.set_gid(owner.gid() as u64);
+            file.set_cksum();
+            builder.append_data(&mut file, path, payload).unwrap();
+        }
+
+        let destination = tmp.path().join("layer");
+        std::fs::create_dir(&destination).unwrap();
+        let bytes =
+            extract_oci_layer_with_size(&builder.into_inner().unwrap()[..], &destination).unwrap();
+
+        assert_eq!(bytes, 8);
+        assert_eq!(
+            std::fs::read(destination.join("nested/two")).unwrap(),
+            b"45678"
+        );
     }
 }

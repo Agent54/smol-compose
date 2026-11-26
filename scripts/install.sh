@@ -2,8 +2,9 @@
 # smolvm installer
 #
 # CANONICAL SOURCE: scripts/install.sh in the smolvm repo
-# The website copy at smolmachines/docs/public/install.sh must be kept in sync.
-# After editing this file, copy it to smolmachines/docs/public/install.sh
+# The website copy at smolmachines/static/install.sh (served at
+# https://smolmachines.com/install.sh) must be kept in sync.
+# After editing this file, copy it verbatim to smolmachines/static/install.sh.
 #
 # Usage:
 #   curl -sSL https://smolmachines.com/install.sh | bash
@@ -160,20 +161,40 @@ check_requirements() {
 # Get latest version from GitHub
 get_latest_version() {
     local url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local version
+    local body version
 
+    # Keep the body rather than piping straight into grep: on a rate-limit the
+    # API answers 200-or-403 with a JSON error object, and that object is the
+    # only thing that says which failure this is. `|| body=""` because `set -e`
+    # would otherwise kill the subshell before the diagnosis below can run.
     if command -v curl &> /dev/null; then
-        version=$(curl -sSL "$url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+        body=$(curl -sSL "$url" 2>/dev/null) || body=""
     else
-        version=$(wget -qO- "$url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+        body=$(wget -qO- "$url" 2>/dev/null) || body=""
     fi
 
-    if [[ -z "$version" ]]; then
-        # Fallback to a default version if GitHub API fails
-        echo "0.1.1"
-    else
+    version=$(printf '%s' "$body" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+
+    if [[ -n "$version" ]]; then
         echo "$version"
+        return 0
     fi
+
+    # No tag_name means the API did not hand us a release. Never guess one: the
+    # hardcoded fallback that used to live here published no Linux asset, so it
+    # 404'd there, and on macOS it silently installed *older* than what was
+    # already on the machine. Failing loudly is the only safe answer.
+    error "Could not determine the latest smolvm version from the GitHub API."
+    if printf '%s' "$body" | grep -q "rate limit exceeded"; then
+        error "GitHub is rate-limiting this machine, so the release lookup was refused."
+        error "Wait for the limit to reset, or install a specific version:"
+    else
+        error "No release information came back from $url"
+        error "Check network access to api.github.com, or install a specific version:"
+    fi
+    error "  curl -sSL https://smolmachines.com/install.sh | bash -s -- --version VERSION"
+    error "Released versions: https://github.com/${GITHUB_REPO}/releases"
+    exit 1
 }
 
 # Download file
@@ -246,6 +267,91 @@ verify_checksum() {
 
     info "Checksum verified"
     return 0
+}
+
+# Decompressed size a zstd frame declares, without decompressing it and without
+# needing a zstd binary (macOS ships none). Reads the frame header: the
+# descriptor byte selects the width of the content-size field and whether a
+# window byte and a dictionary id sit in front of it.
+zstd_declared_size() {
+    local file="$1"
+    local -a b
+    read -r -a b <<< "$(od -A n -t u1 -N 18 -v "$file" | tr -s ' \n' ' ')"
+    [[ "${b[0]}" == 40 && "${b[1]}" == 181 && "${b[2]}" == 47 && "${b[3]}" == 253 ]] || return 1
+
+    local desc=${b[4]}
+    local fcs_flag=$(( (desc >> 6) & 3 ))
+    local single_segment=$(( (desc >> 5) & 1 ))
+    local did_flag=$(( desc & 3 ))
+
+    local fcs_size did_size
+    case "$fcs_flag" in
+        0) fcs_size=$(( single_segment == 1 ? 1 : 0 )) ;;
+        1) fcs_size=2 ;;
+        2) fcs_size=4 ;;
+        3) fcs_size=8 ;;
+    esac
+    case "$did_flag" in
+        0) did_size=0 ;; 1) did_size=1 ;; 2) did_size=2 ;; 3) did_size=4 ;;
+    esac
+    [[ "$fcs_size" -eq 0 ]] && return 1
+
+    local offset=$(( 5 + (single_segment == 1 ? 0 : 1) + did_size ))
+    local value=0 i
+    for (( i = fcs_size - 1; i >= 0; i-- )); do
+        value=$(( value * 256 + b[offset + i] ))
+    done
+    # A 2-byte field is stored biased by 256.
+    [[ "$fcs_size" -eq 2 ]] && value=$(( value + 256 ))
+    echo "$value"
+}
+
+# Fail the install unless the templates the runtime will look for are present
+# and will present their full virtual size.
+#
+# The runtime resolves `<name>` before `<name>.zst`, under ~/.smolvm and beside
+# the binary, and takes the instant copy-on-write boot path only when the
+# resolved template is at least the disk type's default size. `$prefix` is both
+# of those roots for an install: it is the default prefix, and it is the
+# directory the installed binary runs from. A compressed template is measured by
+# the size its frame declares, which is what expanding it produces.
+verify_disk_templates() {
+    local prefix="$1"
+    local spec name min_bytes resolved size
+    local failed=0
+
+    for spec in "storage-template.ext4:21474836480" "overlay-template.ext4:10737418240"; do
+        name="${spec%%:*}"
+        min_bytes="${spec##*:}"
+
+        if [[ -f "$prefix/$name" ]]; then
+            resolved="$prefix/$name"
+            size=$(wc -c < "$resolved" | tr -d ' ')
+        elif [[ -f "$prefix/$name.zst" ]]; then
+            resolved="$prefix/$name.zst"
+            if ! size=$(zstd_declared_size "$prefix/$name.zst"); then
+                error "$name.zst is not a readable zstd template"
+                failed=1
+                continue
+            fi
+        else
+            error "$name is missing from $prefix after install"
+            failed=1
+            continue
+        fi
+
+        if [[ "$size" -lt "$min_bytes" ]]; then
+            error "$(basename "$resolved") gives $size bytes, need at least $min_bytes"
+            failed=1
+        fi
+    done
+
+    if [[ "$failed" -ne 0 ]]; then
+        error "This release cannot serve 'pack create' or 'machine checkpoint' without a"
+        error "host mkfs.ext4, and fresh Linux boots would lose the fast disk path."
+        error "Please report this against the release; the install is incomplete."
+        return 1
+    fi
 }
 
 # Install smolvm
@@ -344,6 +450,18 @@ install_smolvm() {
         warn "$prefix/lib exists but no .version file found — skipping lib/ removal"
         warn "If this is a previous smolvm install, remove it manually first"
     fi
+    # An older layout bundled agent-rootfs next to the binary, and the wrapper
+    # prefers that copy over the one in the data directory. Upgrades refresh the
+    # data-dir copy but left this one in place, so a new binary kept booting a
+    # stale agent — which silently ignores request fields it does not know (a
+    # remote volume, say) rather than failing. Remove it so the wrapper falls
+    # through to the rootfs this install actually wrote.
+    if [[ -d "$prefix/agent-rootfs" ]] && [[ -f "$prefix/.version" ]]; then
+        rm -rf "$prefix/agent-rootfs"
+    elif [[ -d "$prefix/agent-rootfs" ]]; then
+        warn "$prefix/agent-rootfs exists but no .version file found — skipping removal"
+        warn "If this is a previous smolvm install, remove it manually first"
+    fi
     if [[ -f "$prefix/smolvm" ]]; then
         rm -f "$prefix/smolvm"
     fi
@@ -362,8 +480,14 @@ install_smolvm() {
     if [[ -f "$prefix/storage-template.ext4" ]]; then
         rm -f "$prefix/storage-template.ext4"
     fi
+    if [[ -f "$prefix/storage-template.ext4.zst" ]]; then
+        rm -f "$prefix/storage-template.ext4.zst"
+    fi
     if [[ -f "$prefix/overlay-template.ext4" ]]; then
         rm -f "$prefix/overlay-template.ext4"
+    fi
+    if [[ -f "$prefix/overlay-template.ext4.zst" ]]; then
+        rm -f "$prefix/overlay-template.ext4.zst"
     fi
 
     # Copy files
@@ -384,11 +508,31 @@ install_smolvm() {
         has_smol=true
     fi
 
-    # Copy disk templates if present
-    if [[ -f "$extracted_dir/storage-template.ext4" ]]; then
+    # Copy the Kubernetes runtime if the distribution includes it (Linux
+    # tarballs only; older ones won't have it). Without this the shim ships in
+    # the release but never reaches disk, so `runtimeClassName: smolvm` stays
+    # out of reach for anyone who installed with this script.
+    if [[ -f "$extracted_dir/containerd-shim-smolvm-v2" ]]; then
+        cp "$extracted_dir/containerd-shim-smolvm-v2" "$prefix/"
+        chmod +x "$prefix/containerd-shim-smolvm-v2"
+        if [[ -d "$extracted_dir/kubernetes" ]]; then
+            rm -rf "$prefix/kubernetes"
+            cp -r "$extracted_dir/kubernetes" "$prefix/"
+            chmod +x "$prefix/kubernetes/install-k8s-runtime.sh" 2>/dev/null || true
+        fi
+    fi
+
+    # Copy disk templates if present. Releases ship them zstd-compressed, and
+    # the runtime expands a `.zst` next to itself on first use, so either form
+    # is usable; prefer the compressed one the tarball actually carries.
+    if [[ -f "$extracted_dir/storage-template.ext4.zst" ]]; then
+        cp "$extracted_dir/storage-template.ext4.zst" "$prefix/"
+    elif [[ -f "$extracted_dir/storage-template.ext4" ]]; then
         cp "$extracted_dir/storage-template.ext4" "$prefix/"
     fi
-    if [[ -f "$extracted_dir/overlay-template.ext4" ]]; then
+    if [[ -f "$extracted_dir/overlay-template.ext4.zst" ]]; then
+        cp "$extracted_dir/overlay-template.ext4.zst" "$prefix/"
+    elif [[ -f "$extracted_dir/overlay-template.ext4" ]]; then
         cp "$extracted_dir/overlay-template.ext4" "$prefix/"
     fi
 
@@ -400,9 +544,15 @@ install_smolvm() {
     # Linux) and needs `truncate` (GNU coreutils); skipped otherwise, in which
     # case the runtime safely falls back to the copy path. The sizes mirror
     # DEFAULT_STORAGE_SIZE_GIB (20) and DEFAULT_OVERLAY_SIZE_GIB (10).
-    if command -v truncate >/dev/null 2>&1; then
+    if [[ "$(uname -s)" == "Linux" ]] && command -v truncate >/dev/null 2>&1; then
         [[ -f "$prefix/storage-template.ext4" ]] && truncate -s 20G "$prefix/storage-template.ext4"
         [[ -f "$prefix/overlay-template.ext4" ]] && truncate -s 10G "$prefix/overlay-template.ext4"
+    fi
+
+    # Templates are final here; nothing installed later touches them.
+    if ! verify_disk_templates "$prefix"; then
+        rm -rf "$tmp_dir"
+        exit 1
     fi
 
     # Install agent-rootfs to data directory

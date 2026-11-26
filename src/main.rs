@@ -69,6 +69,23 @@ enum Commands {
         fd: i32,
     },
 
+    /// Internal: broker a host video encoder for one VM
+    #[command(name = "_video-encoder", hide = true)]
+    VideoEncoder {
+        /// Mode-0600 Unix socket used by the owning VMM
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        /// VMM process whose lifetime owns this helper
+        #[arg(long)]
+        owner_pid: u32,
+        /// Per-VM uid to drop to before accepting encoder sessions
+        #[arg(long, requires = "run_as_gid")]
+        run_as_uid: Option<u32>,
+        /// Primary gid paired with `run_as_uid`
+        #[arg(long, requires = "run_as_uid")]
+        run_as_gid: Option<u32>,
+    },
+
     /// Internal: clean up an ephemeral VM after its command exits (not for direct use)
     #[command(name = "_cleanup-ephemeral", hide = true)]
     CleanupEphemeral {
@@ -109,6 +126,9 @@ fn stray_stub_note(exe_stem: &str) -> Option<String> {
 }
 
 fn main() {
+    // Lets pack extraction pick host-side layers when this host's virtiofs
+    // server can present their recorded ownership.
+    smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);
     // Honor an explicit SMOLVM_DATA_DIR for EVERY command (so the CLI and serve
     // agree on where smolvm state lives) before anything computes a path. The
     // auto /var/lib/smolvm default is serve-only (applied in its run()). Done
@@ -136,6 +156,7 @@ fn main() {
             | Some("_cuda-daemon")
             | Some("_cuda-clone-worker")
             | Some("_cuda-mps-supervisor")
+            | Some("_video-encoder")
     );
     if !internal {
         if let Some(mode) = smolvm_pack::detect_packed_mode() {
@@ -170,7 +191,7 @@ fn main() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
-        Commands::BootVm { config } => cli::internal_boot::run(config),
+        Commands::BootVm { config } => smolvm::internal_boot::run(config),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
             smolvm::cuda_daemon::run(&socket).map_err(smolvm::Error::Io)
@@ -198,6 +219,13 @@ fn main() {
             std::io::ErrorKind::Unsupported,
             "NVIDIA MPS supervision is Linux-only",
         ))),
+        Commands::VideoEncoder {
+            socket,
+            owner_pid,
+            run_as_uid,
+            run_as_gid,
+        } => smolvm::agent::video::run_helper(&socket, owner_pid, run_as_uid.zip(run_as_gid))
+            .map_err(smolvm::Error::Io),
         Commands::CleanupEphemeral {
             vm_name,
             pid,

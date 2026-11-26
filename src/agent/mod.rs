@@ -5,8 +5,10 @@
 
 pub mod boot_config;
 mod client;
+pub mod display;
 pub mod fork;
 mod fsnotify_watch;
+pub mod input;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
@@ -14,7 +16,68 @@ mod manager;
 pub mod pod_net;
 pub mod state_probe;
 pub mod terminal;
+#[cfg(unix)]
+pub mod video;
+pub(crate) mod virtiofs;
+/// Encoded browser video is unavailable on non-Unix hosts because the helper
+/// transport uses a mode-restricted Unix socket.
+#[cfg(not(unix))]
+pub mod video {
+    /// Leave the existing Raw VNC path active when encoded video is disabled.
+    pub fn prestart_helper() -> Result<(), String> {
+        let disabled = std::env::var_os("SMOLVM_VIDEO").is_none_or(|value| {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("disabled")
+        });
+        if disabled {
+            Ok(())
+        } else {
+            Err("encoded video currently requires Unix sockets".into())
+        }
+    }
+
+    /// Encoded video is never configured on a non-Unix host, so the caller
+    /// does not try to start a helper that cannot exist here.
+    pub fn is_configured() -> bool {
+        false
+    }
+
+    /// Non-Unix hosts always serve Raw VNC.
+    pub fn is_available() -> bool {
+        false
+    }
+
+    /// Reject the encoded browser route without disturbing its Raw RFB socket.
+    pub(crate) fn serve_browser<S: std::io::Read + std::io::Write>(
+        _ws: super::websocket::WsStream<S>,
+        _fb: std::sync::Arc<super::display::DisplayFramebuffer>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "encoded video currently requires Unix sockets",
+        ))
+    }
+
+    /// Reject direct starts of the Unix-only encoder helper.
+    pub fn run_helper(
+        _socket: &std::path::Path,
+        _owner_pid: u32,
+        _run_as: Option<(u32, u32)>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "video encoder helper requires Unix sockets",
+        ))
+    }
+}
+pub mod vnc;
 mod vsock_service;
+mod websocket;
 
 pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
@@ -24,22 +87,64 @@ pub use client::{
     InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
 };
 pub use fsnotify_watch::FsNotifyWatcher;
-pub use krun::KrunFunctions;
+pub use krun::{host_layers_supported, KrunFunctions};
 pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,
     LaunchFeatures, VmDisks,
 };
-pub(crate) use manager::{cleanup_dead_vm_runtime, cleanup_dead_vm_runtime_in_db};
+pub use manager::cleanup_dead_vm_runtime;
+pub(crate) use manager::cleanup_dead_vm_runtime_in_db;
 pub use manager::{
     disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
     prune_orphaned_ready_markers, read_egress_denials, read_egress_telemetry,
-    read_shared_pack_pointer, resolve_disk_image, shared_pack_cache_root, shared_pack_pointer_path,
-    vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir, AgentManager, AgentState,
-    EgressDenial, SHARED_PACK_POINTER,
+    read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
+    shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
+    AgentManager, AgentState, EgressDenial, SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
+
+/// Parse a `WIDTHxHEIGHT` display size (e.g. `"1920x1080"`).
+///
+/// Returns `None` for absent/blank input so "no display" stays the default —
+/// a scanout adds a KMS connector the guest can see, which existing GPU
+/// workloads (CUDA, headless Vulkan) do not need.
+///
+/// Rejects zero and absurd dimensions rather than passing them to libkrun: the
+/// virtio-gpu EDID generator will happily build a nonsense mode, and the guest
+/// then fails far away from the cause.
+pub fn parse_display_size(raw: Option<&str>) -> Option<(u32, u32)> {
+    const MAX_DIM: u32 = 16384;
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (w, h) = raw.split_once(['x', 'X'])?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// Default `KRUN_GPU_BACKEND=2d` on macOS when a display is requested.
+///
+/// The virglrenderer bundled on macOS is Venus-only: it cannot create the
+/// classic 2D resources a scanout serves, so every display path fails until
+/// libkrun is switched to rutabaga's CPU 2D component. Users shouldn't need
+/// to know that; an explicit KRUN_GPU_BACKEND still wins.
+///
+/// Shared by both launchers. Must run before the VM starts — libkrun reads
+/// the variable when it builds the virtio-gpu device.
+pub fn default_gpu_backend_for_display() {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("KRUN_GPU_BACKEND").is_none() {
+        std::env::set_var("KRUN_GPU_BACKEND", "2d");
+        tracing::info!("display requested on macOS: defaulting KRUN_GPU_BACKEND=2d");
+    }
+}
 
 /// Compute the `virgl_flags` bitmask for `krun_set_gpu_options2`.
 ///
@@ -122,4 +227,42 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(test)]
+mod display_size_tests {
+    use super::parse_display_size;
+
+    #[test]
+    fn parses_wxh() {
+        assert_eq!(parse_display_size(Some("1920x1080")), Some((1920, 1080)));
+        assert_eq!(parse_display_size(Some("1280X800")), Some((1280, 800)));
+        assert_eq!(parse_display_size(Some("  1024x768 ")), Some((1024, 768)));
+    }
+
+    // Absent/blank must mean "no display", not a default one: adding a scanout
+    // changes guest topology for every existing --gpu workload.
+    #[test]
+    fn absent_or_blank_means_no_display() {
+        assert_eq!(parse_display_size(None), None);
+        assert_eq!(parse_display_size(Some("")), None);
+        assert_eq!(parse_display_size(Some("   ")), None);
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        for bad in ["1920", "1920x", "x1080", "axb", "1920*1080", "1920x1080x60"] {
+            assert_eq!(parse_display_size(Some(bad)), None, "should reject {bad}");
+        }
+    }
+
+    // Zero would produce a degenerate EDID mode; huge values blow up the
+    // framebuffer allocation. Fail here, where the error names the cause.
+    #[test]
+    fn rejects_zero_and_absurd() {
+        assert_eq!(parse_display_size(Some("0x1080")), None);
+        assert_eq!(parse_display_size(Some("1920x0")), None);
+        assert_eq!(parse_display_size(Some("99999x1080")), None);
+        assert_eq!(parse_display_size(Some("1920x99999")), None);
+    }
 }

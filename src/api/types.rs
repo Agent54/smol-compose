@@ -44,6 +44,9 @@ pub struct MountSpec {
     /// Read-only mount.
     #[serde(default)]
     pub readonly: bool,
+    /// Use a guest-local working copy and synchronize it in batches.
+    #[serde(default)]
+    pub staged: bool,
 }
 
 /// Mount information (for responses, includes virtiofs tag).
@@ -60,6 +63,8 @@ pub struct MountInfo {
     pub target: String,
     /// Read-only mount.
     pub readonly: bool,
+    /// Whether this is a guest-local staged mount.
+    pub staged: bool,
 }
 
 /// Port mapping specification.
@@ -104,6 +109,10 @@ pub struct ResourceSpec {
     #[serde(default)]
     #[schema(example = 10)]
     pub overlay_gb: Option<u64>,
+    /// Host block I/O engine. `sync` is the default; `async` submits queued raw-disk
+    /// reads through a restricted io_uring on Linux hosts.
+    #[serde(default)]
+    pub block_io: Option<crate::data::resources::BlockIoEngine>,
     /// Allowed egress CIDR ranges. When set, only these IP ranges are reachable.
     /// Omit for unrestricted egress. Empty list denies all egress.
     #[serde(default)]
@@ -130,8 +139,13 @@ pub struct ResourceSpec {
 // ============================================================================
 
 /// Request to execute a command in a machine.
+///
+/// `deny_unknown_fields`: an unknown or mis-cased field is a hard 400, not a
+/// silent no-op. This matters for the safety fields (`timeoutSecs`, etc.) — a
+/// caller who writes `timeout_secs` must be told, not left running an untrusted
+/// command with no timeout because the field was quietly dropped.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecRequest {
     /// Command and arguments.
     #[schema(example = json!(["echo", "hello"]))]
@@ -148,6 +162,12 @@ pub struct ExecRequest {
     #[serde(default)]
     #[schema(example = "/workspace")]
     pub workdir: Option<String>,
+    /// Run as this user: a name from the image or a numeric `uid[:gid]`,
+    /// overriding the image's USER. Only meaningful for image machines; a bare
+    /// VM has no container user to become.
+    #[serde(default)]
+    #[schema(example = "1000:1000")]
+    pub user: Option<String>,
     /// Timeout in seconds.
     #[serde(default)]
     #[schema(example = 30)]
@@ -282,8 +302,11 @@ pub struct WarmArtifactResponse {
 }
 
 /// Request to run a command in an image.
+///
+/// `deny_unknown_fields`: like `ExecRequest`, a mis-cased safety field
+/// (`timeout_secs` for `timeoutSecs`) is a 400, never a silent drop.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunRequest {
     /// Image to run in.
     #[schema(example = "python:3.12-alpine")]
@@ -301,6 +324,11 @@ pub struct RunRequest {
     /// Working directory.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Run as this user: a name from the image or a numeric `uid[:gid]`,
+    /// overriding the image's USER.
+    #[serde(default)]
+    #[schema(example = "1000:1000")]
+    pub user: Option<String>,
     /// Timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -451,6 +479,25 @@ pub struct CapacityResponse {
     pub used_cpus: f64,
     /// Real resident memory (MB) across VM processes.
     pub used_memory_mb: u64,
+    /// Proportional resident memory (MB) across VM processes. Unlike summed
+    /// RSS, this counts clean pages shared by branch siblings only once in the
+    /// aggregate. Omitted where the host cannot provide process PSS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory_pss_mb: Option<u64>,
+    /// Private resident memory (MB) across VM processes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory_private_mb: Option<u64>,
+    /// Sum of shared bytes mapped by VM processes (MB). This is a mapping gauge,
+    /// not a unique physical-memory total; use `used_memory_pss_mb` for that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory_shared_mapped_mb: Option<u64>,
+    /// Effective memory ceiling (MB) available to this runtime, constrained by
+    /// finite cgroup-v2 ancestors where applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_memory_total_mb: Option<u64>,
+    /// Effective memory currently available (MB) to this runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_memory_available_mb: Option<u64>,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
     /// Opaque id minted once per serve process. It changes iff the serve restarts
@@ -458,6 +505,32 @@ pub struct CapacityResponse {
     /// in-memory VM state) was wiped, so it can prune the now-stale pool records.
     #[serde(default)]
     pub boot_id: String,
+    /// CUDA devices currently visible to this runtime. Omitted when NVML is
+    /// unavailable, no CUDA device is visible, or the latest sample failed.
+    /// Device ordinals use the same CUDA-visible ordering as
+    /// `SMOLVM_CUDA_DEVICE` and fork-pool admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_devices: Option<Vec<CudaDeviceCapacity>>,
+}
+
+/// Live capacity and identity for one host CUDA device.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CudaDeviceCapacity {
+    /// CUDA-visible ordinal used to assign a machine or pool to this device.
+    pub ordinal: u32,
+    /// Stable NVIDIA GPU or MIG UUID.
+    pub uuid: String,
+    /// Device model reported by NVML.
+    pub name: String,
+    /// Current streaming-multiprocessor utilization percentage.
+    pub utilization_percent: f64,
+    /// Current device-memory usage in MiB.
+    pub memory_used_mib: u64,
+    /// Current free device memory in MiB.
+    pub memory_free_mib: u64,
+    /// Total device-memory capacity in MiB.
+    pub memory_total_mib: u64,
 }
 
 // ============================================================================
@@ -534,6 +607,9 @@ pub struct CreateMachineRequest {
     /// Overlay disk size in GiB (default: 10).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
+    /// Host block I/O engine. `sync` is the default; `async` is opt-in.
+    #[serde(default)]
+    pub block_io: Option<crate::data::resources::BlockIoEngine>,
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -558,8 +634,9 @@ pub struct CreateMachineRequest {
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
-    /// Path to a .smolmachine sidecar file. Creates the machine from pre-packed
-    /// layers instead of pulling from a registry. Mutually exclusive with `image`.
+    /// Path to a `.smolmachine` or `.smolcheckpoint` artifact. Creates from
+    /// pre-packed layers or restores the artifact's captured live state.
+    /// Mutually exclusive with `image`.
     #[serde(default)]
     pub from: Option<String>,
     /// Registry reference to a .smolmachine artifact (e.g., "myapp:v1").
@@ -606,6 +683,10 @@ pub struct MachineInfo {
     /// Machine name.
     #[schema(example = "my-vm")]
     pub name: String,
+    /// Resolved workload image, used to bind registry credentials to its host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "registry.example.com/team/app:latest")]
+    pub image: Option<String>,
     /// Current state ("created", "running", "stopped").
     #[schema(example = "running")]
     pub state: String,
@@ -626,6 +707,10 @@ pub struct MachineInfo {
     pub ports: Vec<PortSpec>,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Whether Vulkan/graphics GPU acceleration is enabled for this machine.
+    pub gpu: bool,
+    /// Whether transparent CUDA remoting is enabled for this machine.
+    pub cuda: bool,
     /// Network backend the machine runs (`tsi` or `virtio-net`). Echoes back
     /// what `create` accepted; omitted when `create` left it unset (the
     /// launch then picks the contextual default — `virtio-net` under
@@ -646,16 +731,28 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
-    /// Whether ordinary starts launch this machine as a fork base.
+    /// Host block I/O engine used by this machine.
+    pub block_io: crate::data::resources::BlockIoEngine,
+    /// Whether ordinary starts launch this machine as a branch source.
+    pub branchable: bool,
+    /// Legacy alias for `branchable`.
     pub forkable: bool,
-    /// Planned runnable CUDA clone count used for automatic capacity budgeting.
+    /// Immediate parent machine when this machine was created by branching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_machine: Option<String>,
+    /// Planned runnable CUDA child count used for automatic capacity budgeting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_branch_pool_size: Option<u32>,
+    /// Legacy alias for `cuda_branch_pool_size`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_fork_pool_size: Option<u32>,
-    /// Explicit logical CUDA memory limit per golden/clone session, in MiB.
+    /// Explicit logical CUDA memory limit per source/child session, in MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_vram_limit_mib: Option<u64>,
-    /// True while this clone is an already-booted clean slot parked at the
-    /// workload forkpoint and available for one assignment.
+    /// True while this child is an already-booted clean slot parked at the
+    /// workload branchpoint and available for one assignment.
+    pub branchpoint_held: bool,
+    /// Legacy alias for `branchpoint_held`.
     pub forkpoint_held: bool,
     /// Cumulative guest-outbound (egress) bytes since boot, for billing. Present
     /// only for virtio-net machines that have reported a value; omitted for TSI
@@ -685,6 +782,20 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 128)]
     pub rss_mb: Option<u64>,
+    /// Proportional resident memory (PSS) in MiB. Summing this across branch
+    /// siblings accounts shared clean pages once instead of once per sibling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 72)]
+    pub pss_mb: Option<u64>,
+    /// Private resident memory in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 48)]
+    pub private_memory_mb: Option<u64>,
+    /// Shared memory mapped by this VMM in MiB. This is not a unique physical
+    /// total when summed; use PSS for physical accounting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 384)]
+    pub shared_memory_mapped_mb: Option<u64>,
     /// Actual host disk consumed by this machine's data dir, in MiB (real blocks of
     /// the sparse disk images, not provisioned capacity). An instantaneous gauge the
     /// control integrates over time for active-disk billing. Omitted when the data
@@ -783,17 +894,18 @@ pub struct ResizeMachineRequest {
 /// Query string for `POST /machines/{name}/start`.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct StartMachineQuery {
-    /// Start as a fork base: back the guest RAM with a memfd (copy-on-write
-    /// cloneable) and expose a control socket so the machine can later be forked
-    /// with `POST /machines/{name}/fork`. The golden freezes after its first fork.
-    #[serde(default)]
+    /// Start as a branch source: back the guest RAM with a memfd (copy-on-write
+    /// cloneable) and expose a control socket so the machine can later be branched
+    /// with `POST /machines/{name}/branches`. Linux/x86_64 keeps the source running;
+    /// other hosts retain it as the frozen copy-on-write base.
+    #[serde(default, rename = "branchable", alias = "forkable")]
     pub forkable: bool,
-    /// Number of runnable CUDA fork clones planned for this golden. Supplying
-    /// it enables forkable launch and transparent pre-initialization VRAM
+    /// Number of runnable CUDA children planned for this source. Supplying it
+    /// enables branchable launch and transparent pre-initialization VRAM
     /// budgeting for cache-sizing frameworks.
-    #[serde(default, rename = "forkPoolSize")]
+    #[serde(default, rename = "branchPoolSize", alias = "forkPoolSize")]
     pub fork_pool_size: Option<u32>,
-    /// Explicit logical VRAM limit per golden/clone session, in MiB.
+    /// Explicit logical VRAM limit per source/child session, in MiB.
     #[serde(default, rename = "cudaVramLimitMib")]
     pub cuda_vram_limit_mib: Option<u64>,
 }
@@ -852,13 +964,18 @@ pub struct StartMachineRequest {
     pub registry_auth: Option<RegistryAuthSpec>,
 }
 
-/// Request to fork a running, forkable golden machine into a new clone.
+/// Request to branch a running, branchable source machine into a new child.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkRequest {
-    /// Name for the new clone machine.
+    /// Name for the new child machine.
     #[schema(example = "clone-1")]
     pub name: String,
+    /// Materialize the restored child as a new branch source so it can be
+    /// branched again. This pays one eager guest-memory copy at child boot;
+    /// descendants remain copy-on-write.
+    #[serde(default, rename = "branchable", alias = "forkable")]
+    pub forkable: bool,
     /// Pin the clone's inbound port forwards. Without this, the golden's
     /// forwards are remapped to freshly-allocated host ports so the clone does
     /// not collide with the still-running golden or sibling clones.
@@ -898,6 +1015,9 @@ pub struct ForkRequest {
     pub secrets: RequestSecretRefs,
 }
 
+/// Preferred public name for [`ForkRequest`].
+pub type BranchRequest = ForkRequest;
+
 /// Assignment for one already-booted held fork slot.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -907,6 +1027,9 @@ pub struct ForkReleaseRequest {
     #[serde(default)]
     pub env: Vec<String>,
 }
+
+/// Preferred public name for [`ForkReleaseRequest`].
+pub type BranchReleaseRequest = ForkReleaseRequest;
 
 // ============================================================================
 // Automatic fork-pool types
@@ -919,8 +1042,9 @@ pub struct CreateForkPoolRequest {
     /// Stable pool name.
     #[schema(example = "grpo-rollouts")]
     pub name: String,
-    /// Existing running forkable machine whose workload is at the forkpoint.
-    #[schema(example = "policy-golden")]
+    /// Existing running branchable machine whose workload is at the branch point.
+    #[serde(rename = "source", alias = "golden")]
+    #[schema(example = "policy-source")]
     pub golden: String,
     /// Number of clean workers kept booted and ready.
     #[schema(example = 8)]
@@ -943,6 +1067,9 @@ pub struct CreateForkPoolRequest {
     pub lease_ttl_secs: Option<u64>,
 }
 
+/// Preferred public name for [`CreateForkPoolRequest`].
+pub type CreateBranchPoolRequest = CreateForkPoolRequest;
+
 /// Query parameters for deleting a fork pool.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct DeleteForkPoolQuery {
@@ -950,6 +1077,9 @@ pub struct DeleteForkPoolQuery {
     #[serde(default)]
     pub force: bool,
 }
+
+/// Preferred public name for [`DeleteForkPoolQuery`].
+pub type DeleteBranchPoolQuery = DeleteForkPoolQuery;
 
 /// Request to change a pool's clean-worker target.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -959,13 +1089,18 @@ pub struct ResizeForkPoolRequest {
     pub desired_ready: u32,
 }
 
+/// Preferred public name for [`ResizeForkPoolRequest`].
+pub type ResizeBranchPoolRequest = ResizeForkPoolRequest;
+
 /// Current size and lifecycle state of an automatic fork pool.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkPoolInfo {
     /// Stable pool name.
     pub name: String,
-    /// Forkable source machine.
+    /// Branchable source machine.
+    pub source: String,
+    /// Legacy alias for `source`.
     pub golden: String,
     /// Configured clean-worker target.
     pub desired_ready: u32,
@@ -1021,12 +1156,18 @@ pub struct ForkPoolInfo {
     pub created_at: u64,
 }
 
+/// Preferred public name for [`ForkPoolInfo`].
+pub type BranchPoolInfo = ForkPoolInfo;
+
 /// List response for automatic fork pools.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ListForkPoolsResponse {
     /// All pools on this node.
     pub pools: Vec<ForkPoolInfo>,
 }
+
+/// Preferred public name for [`ListForkPoolsResponse`].
+pub type ListBranchPoolsResponse = ListForkPoolsResponse;
 
 /// Request to acquire one clean worker from a fork pool.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -1058,6 +1199,9 @@ pub struct AcquireForkLeaseRequest {
     pub rollout_access: Option<RolloutLeaseAccess>,
 }
 
+/// Preferred public name for [`AcquireForkLeaseRequest`].
+pub type AcquireBranchLeaseRequest = AcquireForkLeaseRequest;
+
 /// A bounded group of ordinary fork-pool lease requests.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1066,6 +1210,9 @@ pub struct AcquireForkLeaseBatchRequest {
     /// at most 32 items may wait for workload readiness in one call.
     pub leases: Vec<AcquireForkLeaseRequest>,
 }
+
+/// Preferred public name for [`AcquireForkLeaseBatchRequest`].
+pub type AcquireBranchLeaseBatchRequest = AcquireForkLeaseBatchRequest;
 
 /// One ordered result from a fork-pool lease batch.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1084,6 +1231,9 @@ pub struct ForkLeaseBatchItemResponse {
     pub error: Option<String>,
 }
 
+/// Preferred public name for [`ForkLeaseBatchItemResponse`].
+pub type BranchLeaseBatchItemResponse = ForkLeaseBatchItemResponse;
+
 /// Ordered results from a bounded fork-pool lease batch.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1091,6 +1241,9 @@ pub struct AcquireForkLeaseBatchResponse {
     /// One result per submitted lease request, in input order.
     pub leases: Vec<ForkLeaseBatchItemResponse>,
 }
+
+/// Preferred public name for [`AcquireForkLeaseBatchResponse`].
+pub type AcquireBranchLeaseBatchResponse = AcquireForkLeaseBatchResponse;
 
 /// Least-privilege fused-rollout scope injected into one pool worker.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
@@ -1117,6 +1270,9 @@ pub struct ForkLeasePayloadFile {
     #[schema(example = 420)]
     pub mode: Option<u32>,
 }
+
+/// Preferred public name for [`ForkLeasePayloadFile`].
+pub type BranchLeasePayloadFile = ForkLeasePayloadFile;
 
 impl std::fmt::Debug for ForkLeasePayloadFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1147,6 +1303,70 @@ pub struct ForkLeaseInfo {
     /// Activation failure, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Preferred public name for [`ForkLeaseInfo`].
+pub type BranchLeaseInfo = ForkLeaseInfo;
+
+#[cfg(test)]
+mod deny_unknown_field_tests {
+    use super::*;
+
+    /// The correct camelCase `timeoutSecs` deserializes and applies.
+    /// `user` is accepted on both exec and ephemeral run, and is absent by
+    /// default so every existing client keeps working. `deny_unknown_fields`
+    /// on these types is what makes an older serve REJECT the field instead of
+    /// silently running as the wrong account, so this is the contract both
+    /// the control plane and the CLI rely on.
+    #[test]
+    fn exec_and_run_requests_carry_an_optional_user() {
+        let exec: ExecRequest = serde_json::from_value(
+            serde_json::json!({"command": ["id", "-u"], "user": "1000:1000"}),
+        )
+        .unwrap();
+        assert_eq!(exec.user.as_deref(), Some("1000:1000"));
+        let bare: ExecRequest =
+            serde_json::from_value(serde_json::json!({"command": ["id", "-u"]})).unwrap();
+        assert_eq!(bare.user, None);
+        let run: RunRequest = serde_json::from_value(
+            serde_json::json!({"image": "alpine", "command": ["id", "-u"], "user": "app"}),
+        )
+        .unwrap();
+        assert_eq!(run.user.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn exec_request_accepts_camelcase_timeout() {
+        let req: ExecRequest = serde_json::from_value(
+            serde_json::json!({"command": ["sleep", "30"], "timeoutSecs": 5}),
+        )
+        .expect("camelCase timeoutSecs should parse");
+        assert_eq!(req.timeout_secs, Some(5));
+    }
+
+    /// A mis-cased safety field is REJECTED, not silently dropped — otherwise an
+    /// untrusted command runs with no timeout because the caller wrote
+    /// `timeout_secs`. This is the regression this test guards.
+    #[test]
+    fn exec_request_rejects_snake_case_timeout() {
+        let err = serde_json::from_value::<ExecRequest>(
+            serde_json::json!({"command": ["sleep", "30"], "timeout_secs": 5}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("timeout_secs"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Any unknown field is a hard error, not ignored.
+    #[test]
+    fn run_request_rejects_unknown_field() {
+        assert!(serde_json::from_value::<RunRequest>(
+            serde_json::json!({"image": "alpine", "command": ["true"], "bogus": 1})
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1223,5 +1443,45 @@ mod registry_auth_tests {
         assert!(!request.wait_ready);
         assert!(!request.hold);
         assert_eq!(request.ready_timeout_secs, None);
+    }
+
+    #[test]
+    fn branch_requests_accept_new_and_legacy_branchable_names() {
+        let branch: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "child-1",
+            "branchable": true
+        }))
+        .unwrap();
+        assert!(branch.forkable);
+
+        let legacy: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "child-2",
+            "forkable": true
+        }))
+        .unwrap();
+        assert!(legacy.forkable);
+
+        let serialized = serde_json::to_value(branch).unwrap();
+        assert_eq!(serialized["branchable"], true);
+        assert!(serialized.get("forkable").is_none());
+    }
+
+    #[test]
+    fn start_query_accepts_new_and_legacy_branchable_names() {
+        let branch: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"branchable": true})).unwrap();
+        assert!(branch.forkable);
+
+        let legacy: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"forkable": true})).unwrap();
+        assert!(legacy.forkable);
+
+        let branch_pool: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"branchPoolSize": 8})).unwrap();
+        assert_eq!(branch_pool.fork_pool_size, Some(8));
+
+        let legacy_pool: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"forkPoolSize": 4})).unwrap();
+        assert_eq!(legacy_pool.fork_pool_size, Some(4));
     }
 }

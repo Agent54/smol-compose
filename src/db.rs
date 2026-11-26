@@ -17,7 +17,7 @@ use crate::pool::{
 };
 use parking_lot::{Condvar, Mutex};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -346,6 +346,9 @@ impl SmolvmDb {
 
     /// Get the default database path.
     pub fn default_path() -> Result<PathBuf> {
+        if let Some(root) = crate::process::explicit_data_root() {
+            return Ok(root.join("server").join("smolvm.db"));
+        }
         let data_dir = dirs::data_local_dir().ok_or_else(|| {
             Error::database_unavailable("could not determine local data directory")
         })?;
@@ -565,7 +568,14 @@ impl SmolvmDb {
     /// Read + delete happen in a single transaction to prevent TOCTOU races.
     pub fn remove_vm(&self, name: &str) -> Result<Option<VmRecord>> {
         self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin transaction")?;
+            // Reserve the writer before reading. A deferred transaction can
+            // observe a record, lose a cross-process writer race, and fail its
+            // DELETE upgrade with SQLITE_BUSY_SNAPSHOT — which surfaced when
+            // NeMo Gym closed 100 fork leaves concurrently. `busy_timeout`
+            // cannot repair a stale snapshot; IMMEDIATE prevents one.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin vm removal")?;
 
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -637,6 +647,86 @@ impl SmolvmDb {
             .collect())
     }
 
+    /// All descendants of `source`, ordered deepest-first so each machine can
+    /// be deleted before the disk backing it depends on. Rejects a corrupted
+    /// cyclic lineage instead of recursing forever or deleting an ancestor
+    /// before its child.
+    pub fn dependent_descendants_postorder(&self, source: &str) -> Result<Vec<String>> {
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, record) in self.list_vms()? {
+            if let Some(parent) = record.golden {
+                children.entry(parent).or_default().push(name);
+            }
+        }
+        for names in children.values_mut() {
+            names.sort();
+        }
+
+        fn visit(
+            parent: &str,
+            children: &HashMap<String, Vec<String>>,
+            visiting: &mut HashSet<String>,
+            visited: &mut HashSet<String>,
+            ordered: &mut Vec<String>,
+        ) -> Result<()> {
+            if !visiting.insert(parent.to_string()) {
+                return Err(Error::database(
+                    "resolve fork lineage",
+                    format!("cycle detected at machine '{parent}'"),
+                ));
+            }
+            if let Some(direct) = children.get(parent) {
+                for child in direct {
+                    if !visited.contains(child) {
+                        visit(child, children, visiting, visited, ordered)?;
+                        visited.insert(child.clone());
+                        ordered.push(child.clone());
+                    }
+                }
+            }
+            visiting.remove(parent);
+            Ok(())
+        }
+
+        let mut ordered = Vec::new();
+        visit(
+            source,
+            &children,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut ordered,
+        )?;
+        Ok(ordered)
+    }
+
+    /// Number of fork edges from a root machine to `name`.
+    pub fn fork_lineage_depth(&self, name: &str) -> Result<usize> {
+        let records: HashMap<String, VmRecord> = self.list_vms()?.into_iter().collect();
+        let mut current = name;
+        let mut seen = HashSet::new();
+        let mut depth = 0;
+        while let Some(parent) = records
+            .get(current)
+            .and_then(|record| record.golden.as_ref())
+        {
+            if !seen.insert(current.to_string()) {
+                return Err(Error::database(
+                    "resolve fork lineage",
+                    format!("cycle detected at machine '{current}'"),
+                ));
+            }
+            if !records.contains_key(parent) {
+                return Err(Error::database(
+                    "resolve fork lineage",
+                    format!("machine '{current}' references missing parent '{parent}'"),
+                ));
+            }
+            depth += 1;
+            current = parent;
+        }
+        Ok(depth)
+    }
+
     /// Update a VM record in place using a closure.
     ///
     /// Returns the updated record if found, `None` if not found. Read +
@@ -678,6 +768,54 @@ impl SmolvmDb {
             };
 
             tx.commit().db_err("commit vm update")?;
+            Ok(updated)
+        })
+    }
+
+    /// Update several VM records atomically in one write transaction.
+    ///
+    /// Unlike repeated [`Self::update_vm`] calls, either every named record is
+    /// present and committed or none of the mutations become visible.
+    pub fn update_vms<F>(&self, names: &[String], mut f: F) -> Result<Vec<VmRecord>>
+    where
+        F: FnMut(&str, &mut VmRecord),
+    {
+        self.with_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin batch vm update")?;
+            let mut updated = Vec::with_capacity(names.len());
+            let mut seen = HashSet::with_capacity(names.len());
+
+            for name in names {
+                if !seen.insert(name.as_str()) {
+                    return Err(Error::database(
+                        "batch vm update",
+                        format!("duplicate machine name '{name}'"),
+                    ));
+                }
+                let data: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT data FROM vms WHERE name = ?1",
+                        params![name],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .db_err(format!("get vm '{name}' for batch update"))?;
+                let bytes = data.ok_or_else(|| Error::vm_not_found(name))?;
+                let mut record: VmRecord = serde_json::from_slice(&bytes)
+                    .db_err(format!("deserialize vm record '{name}'"))?;
+                f(name, &mut record);
+                let new_data = serde_json::to_vec(&record).db_err("serialize batch vm record")?;
+                tx.execute(
+                    "UPDATE vms SET data = ?2 WHERE name = ?1",
+                    params![name, new_data],
+                )
+                .db_err(format!("update vm '{name}' in batch"))?;
+                updated.push(record);
+            }
+
+            tx.commit().db_err("commit batch vm update")?;
             Ok(updated)
         })
     }
@@ -2059,6 +2197,46 @@ mod tests {
     }
 
     #[test]
+    fn fork_descendants_are_returned_deepest_first() {
+        let (_dir, db) = temp_db();
+        for (name, parent) in [
+            ("root", None),
+            ("child-b", Some("root")),
+            ("child-a", Some("root")),
+            ("grandchild", Some("child-a")),
+            ("great-grandchild", Some("grandchild")),
+        ] {
+            let mut record = VmRecord::new(name.to_string(), 1, 128, vec![], vec![], false);
+            record.golden = parent.map(str::to_string);
+            db.insert_vm(name, &record).unwrap();
+        }
+
+        assert_eq!(
+            db.dependent_descendants_postorder("root").unwrap(),
+            vec!["great-grandchild", "grandchild", "child-a", "child-b"]
+        );
+        assert_eq!(db.fork_lineage_depth("root").unwrap(), 0);
+        assert_eq!(db.fork_lineage_depth("great-grandchild").unwrap(), 3);
+    }
+
+    #[test]
+    fn fork_lineage_rejects_cycles_and_missing_parents() {
+        let (_dir, db) = temp_db();
+        for (name, parent) in [("a", "b"), ("b", "a")] {
+            let mut record = VmRecord::new(name.to_string(), 1, 128, vec![], vec![], false);
+            record.golden = Some(parent.to_string());
+            db.insert_vm(name, &record).unwrap();
+        }
+        assert!(db.dependent_descendants_postorder("a").is_err());
+        assert!(db.fork_lineage_depth("a").is_err());
+
+        let mut orphan = VmRecord::new("orphan".to_string(), 1, 128, vec![], vec![], false);
+        orphan.golden = Some("missing".to_string());
+        db.insert_vm("orphan", &orphan).unwrap();
+        assert!(db.fork_lineage_depth("orphan").is_err());
+    }
+
+    #[test]
     fn concurrent_vm_updates_wait_instead_of_failing_busy_snapshot() {
         let (_dir, db) = temp_db();
         for name in ["slot-0", "slot-1"] {
@@ -2286,6 +2464,59 @@ mod tests {
 
         let result = db.update_vm("nonexistent", |_| {}).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn batch_vm_update_commits_every_record_together() {
+        let (_dir, db) = temp_db();
+        for name in ["clone-0", "clone-1", "clone-2"] {
+            db.insert_vm(
+                name,
+                &VmRecord::new(name.to_string(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        }
+        let names = ["clone-0", "clone-1", "clone-2"].map(str::to_string);
+
+        let updated = db
+            .update_vms(&names, |name, record| {
+                record.state = RecordState::Running;
+                record.pid = Some(100 + name.as_bytes()[6] as i32);
+            })
+            .unwrap();
+
+        assert_eq!(updated.len(), names.len());
+        for name in names {
+            let record = db.get_vm(&name).unwrap().unwrap();
+            assert_eq!(record.state, RecordState::Running);
+            assert!(record.pid.is_some());
+        }
+    }
+
+    #[test]
+    fn batch_vm_update_rolls_back_when_one_record_is_missing() {
+        let (_dir, db) = temp_db();
+        for name in ["clone-0", "clone-2"] {
+            db.insert_vm(
+                name,
+                &VmRecord::new(name.to_string(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        }
+        let names = ["clone-0", "missing", "clone-2"].map(str::to_string);
+
+        db.update_vms(&names, |_, record| {
+            record.state = RecordState::Running;
+        })
+        .expect_err("a missing member must reject the complete batch");
+
+        for name in ["clone-0", "clone-2"] {
+            assert_eq!(
+                db.get_vm(name).unwrap().unwrap().state,
+                RecordState::Created,
+                "the transaction must not publish a partial prefix"
+            );
+        }
     }
 
     #[test]

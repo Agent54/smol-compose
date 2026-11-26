@@ -250,6 +250,13 @@ fi
 echo "Building release binaries..."
 LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
+# The containerd shim, so a release can run pods as microVMs under Kubernetes
+# without a source checkout. Linux only: containerd is the only consumer, and
+# there is nothing to register it with on macOS or Windows.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release -p smolvm-shim --bin containerd-shim-smolvm-v2
+fi
+
 # Build the unified `smol` CLI if its source is present (it lives in a sibling
 # repo checked out at ./smol). It is a separate cargo workspace that depends on
 # the engine by path, so build it from inside ./smol with an ABSOLUTE
@@ -332,6 +339,20 @@ cp ./target/release/smolvm "$DIST_DIR/smolvm-bin"
 cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/smolvm"
 chmod +x "$DIST_DIR/smolvm"
 
+# Kubernetes runtime: the containerd shim plus everything needed to register
+# it. Shipping these means `runtimeClassName: smolvm` is reachable from a
+# downloaded release; previously the shim existed only in the source tree, so
+# the feature was invisible to anyone who installed the normal way.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    mkdir -p "$DIST_DIR/kubernetes"
+    cp ./target/release/containerd-shim-smolvm-v2 "$DIST_DIR/containerd-shim-smolvm-v2"
+    chmod +x "$DIST_DIR/containerd-shim-smolvm-v2"
+    cp ./scripts/install-k8s-runtime.sh "$DIST_DIR/kubernetes/"
+    chmod +x "$DIST_DIR/kubernetes/install-k8s-runtime.sh"
+    cp ./deploy/kubernetes/runtimeclass.yaml ./deploy/kubernetes/example-pod.yaml "$DIST_DIR/kubernetes/"
+    echo "Bundled Kubernetes runtime: containerd-shim-smolvm-v2 + manifests"
+fi
+
 # Copy the unified smol CLI (binary renamed to smol-bin + its own wrapper).
 # The wrapper points at the same lib/ and agent-rootfs, so one tarball serves
 # both `smol` (the user-facing CLI) and `smolvm` (the lower-level engine).
@@ -344,6 +365,9 @@ fi
 # Copy libraries
 if [[ "$(uname -s)" == "Darwin" ]]; then
     cp "$WORK_LIB_DIR/libkrun.dylib" "$DIST_DIR/lib/"
+    if [[ -L "$WORK_LIB_DIR/libkrun.2.dylib" ]]; then
+        cp -a "$WORK_LIB_DIR/libkrun.2.dylib" "$DIST_DIR/lib/"
+    fi
     cp "$WORK_LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
     # Create symlink for compatibility
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
@@ -356,6 +380,19 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
             echo "Bundled GPU library: $gpu_lib ($(du -h "$DIST_DIR/lib/$gpu_lib" | cut -f1))"
         fi
     done
+
+    # libkrun.dylib links GPU libraries at either their Homebrew build paths or
+    # @rpath when it was built against the already-relocated bundled library.
+    # The plain CLI masks this because smolvm-wrapper.sh exports
+    # DYLD_LIBRARY_PATH before exec, but a packed launcher dlopens libkrun with
+    # no such override, so dyld resolves those dependents from the host's
+    # Homebrew install instead of the bundled copies — the forked VM child is
+    # killed mid-dlopen (code-signature-invalid) or fails outright when the
+    # host copy is broken or missing, and the launcher surfaces only the
+    # generic agent-readiness timeout (#1011). Rewrite every such dependent to
+    # @loader_path so libkrun always loads the dylibs bundled beside it, then
+    # re-sign (install_name_tool invalidates the signature).
+    bash "$PROJECT_ROOT/scripts/relocate-libkrun-macos.sh" "$DIST_DIR/lib" "$IDENTITY"
 else
     copy_so_with_symlinks() {
         local lib_prefix="$1"

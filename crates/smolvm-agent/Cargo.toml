@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-agent"
-version = "1.8.3"
+version = "1.16.2"
 edition = "2021"
 description = "Guest agent for smolvm VMs (handles OCI operations and command execution)"
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ smolvm-protocol = { path = "../smolvm-protocol", version = "1.6.1" }
 # Shared, pure-Rust OCI layer extraction (decompress + untar + whiteout→overlay
 # translation). The single implementation this guest and the host image cache
 # both call. Dependency-light + no C-linked crate so it links under musl.
+smolvm-s3fs = { path = "../smolvm-s3fs", version = "1.10.0" }
 smolvm-oci-layer = { path = "../smolvm-oci-layer", version = "1.7.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,7 +35,7 @@ tar = "0.4"
 # against musl (its zstd-sys references glibc's `__memcpy_chk`) and the agent is
 # a static-musl binary, so runtime decompression must be pure Rust.
 flate2 = "1"
-ruzstd = "0.7"
+ruzstd = "0.9.1"
 
 # `zstd` (C-backed) is used ONLY to encode fixtures in unit tests; dev-deps are
 # excluded from the musl release binary, so it never hits the link issue above.
@@ -43,7 +44,7 @@ zstd = "0.13"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.27", features = ["socket", "fs"] }
+nix = { version = "0.27", features = ["socket", "fs", "ioctl"] }
 # The new mount API (fsopen/fsconfig/fsmount/move_mount) for overlay mounts — lets
 # us append each lower layer via `lowerdir+` instead of shelling out to `mount(8)`,
 # whose `-o lowerdir=` value is capped at ~255 bytes. Already in the workspace lock.

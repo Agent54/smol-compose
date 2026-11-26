@@ -390,9 +390,25 @@ pub struct VmRecord {
     #[serde(default = "default_mem")]
     pub mem: u32,
 
+    /// Host engine used for writable virtio block disks.
+    #[serde(default)]
+    pub block_io: crate::data::resources::BlockIoEngine,
+
+    /// Host disks attached beyond the managed storage and overlay disks
+    /// (`--disk`). Persisted so every start re-attaches them in the same order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<crate::data::disk::AttachedDisk>,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
+
+    /// Guest-local working trees synchronized with host directories in
+    /// batches. Kept separate from `mounts` so existing records retain their
+    /// tuple encoding and cannot accidentally reinterpret a staged mount as a
+    /// live writable virtiofs mount.
+    #[serde(default)]
+    pub staged_mounts: Vec<(usize, String, String)>,
 
     /// Port mappings (host_port, guest_port).
     #[serde(default)]
@@ -409,6 +425,12 @@ pub struct VmRecord {
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     #[serde(default)]
     pub gpu: Option<bool>,
+
+    /// Expose host virtualization extensions so the guest can run KVM. Decided
+    /// at create time and persisted, like `gpu`, because it changes how the VM
+    /// is built rather than how it is used.
+    #[serde(default)]
+    pub nested_virt: Option<bool>,
 
     /// GPU shared-memory region size in MiB. `None` → default
     /// (`DEFAULT_GPU_VRAM_MIB`). Ignored unless `gpu` is true.
@@ -435,6 +457,11 @@ pub struct VmRecord {
     /// Set to true after first successful run; reset when init commands change.
     #[serde(default)]
     pub init_completed: bool,
+
+    /// Remote volumes (S3-compatible object stores) mounted inside the guest
+    /// by the agent on every start. See `crate::remote_volume`.
+    #[serde(default)]
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
 
     /// Environment variables for init commands.
     #[serde(default)]
@@ -577,6 +604,33 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
 
+    /// Immutable RAM/disk generation inherited by this clone. This is the
+    /// short directory id under the golden's `s/` tree, never a caller-supplied
+    /// path. It lets the host retain a demand-paging guardian exactly while a
+    /// live clone can still fault pages from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_generation: Option<String>,
+
+    /// Process identity of a live branch source whose RAM has been rebased onto
+    /// private mappings. Such a source can retain its original memfd backing in
+    /// addition to its current private pages even after every older child is
+    /// deleted, so Linux cgroup accounting must keep one structural RAM unit
+    /// until this exact VMM process exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_lineage_pid_start_time: Option<u64>,
+
+    /// Persistent container-overlay owner inherited from the root of a fork
+    /// lineage. A clone's live overlay keeps its original on-disk name across
+    /// every generation; descendants must continue addressing that root name.
+    /// Older one-level clone records omit this and fall back to `golden`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_overlay_owner: Option<String>,
+
+    /// Host UID lineage, independent of names inside the guest filesystem.
+    /// Portable restores establish a new host lineage while retaining guest names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_uid_owner: Option<String>,
+
     /// Whether a fork clone is still parked at the inherited workload
     /// forkpoint. Held clones are clean, already-booted pool slots: a caller
     /// installs the job-specific fork parameters and releases each slot once.
@@ -629,6 +683,14 @@ fn default_mem() -> u32 {
 }
 
 impl VmRecord {
+    /// Host identity owner; guest overlay names only serve as a legacy fallback.
+    pub fn vm_uid_owner(&self) -> Option<&str> {
+        self.host_uid_owner
+            .as_deref()
+            .or(self.fork_overlay_owner.as_deref())
+            .or(self.golden.as_deref())
+    }
+
     /// Whether an ordinary start should launch this machine as a fork base.
     ///
     /// The pool check preserves the behavior of records created before the
@@ -655,17 +717,22 @@ impl VmRecord {
             pid_start_time: None,
             cpus,
             mem,
+            block_io: Default::default(),
+            disks: Vec::new(),
             mounts,
+            staged_mounts: Vec::new(),
             ports,
             published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,
+            nested_virt: None,
             rosetta: None,
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
             init_completed: false,
+            remote_volumes: Vec::new(),
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
@@ -696,6 +763,10 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_generation: None,
+            fork_lineage_pid_start_time: None,
+            fork_overlay_owner: None,
+            host_uid_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
@@ -720,17 +791,22 @@ impl VmRecord {
             pid_start_time: None,
             cpus,
             mem,
+            block_io: Default::default(),
+            disks: Vec::new(),
             mounts,
+            staged_mounts: Vec::new(),
             ports,
             published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,
+            nested_virt: None,
             rosetta: None,
             restart,
             last_exit_code: None,
             init: Vec::new(),
             init_completed: false,
+            remote_volumes: Vec::new(),
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
@@ -761,6 +837,10 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_generation: None,
+            fork_lineage_pid_start_time: None,
+            fork_overlay_owner: None,
+            host_uid_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
@@ -794,14 +874,42 @@ impl VmRecord {
 
     /// Convert stored mounts to HostMount format.
     pub fn host_mounts(&self) -> Vec<crate::data::storage::HostMount> {
-        self.mounts
+        let mut live = self
+            .mounts
             .iter()
             .map(|(host, guest, ro)| crate::data::storage::HostMount {
                 source: std::path::PathBuf::from(host),
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,
+                staged: false,
             })
-            .collect()
+            .collect::<std::collections::VecDeque<_>>();
+        let staged = self
+            .staged_mounts
+            .iter()
+            .map(|(index, host, guest)| {
+                (
+                    *index,
+                    crate::data::storage::HostMount::from_staged_storage_tuple(
+                        host.clone(),
+                        guest.clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let total = live.len() + staged.len();
+        let mut mounts = Vec::with_capacity(total);
+        for index in 0..total {
+            if let Some(mount) = staged.get(&index) {
+                mounts.push(mount.clone());
+            } else if let Some(mount) = live.pop_front() {
+                mounts.push(mount);
+            }
+        }
+        // Malformed records with duplicate/out-of-range staged indices remain
+        // inspectable rather than silently dropping their live mounts.
+        mounts.extend(live);
+        mounts
     }
 
     /// Convert stored ports to PortMapping format.
@@ -877,6 +985,35 @@ impl VmRecord {
         ))
     }
 
+    /// Remote volumes are mounted into the workload container's mount
+    /// namespace, so there has to be a container: refuse configurations that
+    /// can never mount at create instead of failing every start. Shared by the
+    /// CLI and API create paths.
+    pub fn validate_remote_volumes(&self) -> crate::Result<()> {
+        if self.remote_volumes.is_empty() {
+            return Ok(());
+        }
+        if self.image.is_none() {
+            return Err(crate::Error::config(
+                "create machine",
+                "remote volumes require an image machine: they are mounted into \
+                 the workload container's mount namespace",
+            ));
+        }
+        let plan = crate::network::plan_launch_network(
+            &self.vm_resources(),
+            self.dns_filter_hosts.as_deref(),
+            self.ports.len(),
+        );
+        if !plan.has_network() {
+            return Err(crate::Error::config(
+                "create machine",
+                "remote volumes need network access: add --net (or an egress policy)",
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert record fields to VmResources.
     pub fn vm_resources(&self) -> crate::agent::VmResources {
         crate::agent::VmResources {
@@ -887,9 +1024,12 @@ impl VmRecord {
             gpu: self.gpu.unwrap_or(false),
             gpu_vram_mib: self.gpu_vram_mib,
             cuda: self.cuda,
+            nested_virt: self.nested_virt.unwrap_or(false),
             rosetta: self.rosetta.unwrap_or(false),
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
+            block_io: self.block_io,
+            disks: self.disks.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
@@ -1353,6 +1493,52 @@ mod tests {
         assert_eq!(deserialized.overlay_gb, Some(20));
     }
 
+    /// Attached disks must survive the record: `start` re-attaches from the
+    /// record, so a disk that round-trips badly silently disappears on restart.
+    #[test]
+    fn attached_disks_round_trip_and_default_to_empty() {
+        let legacy = r#"{"name":"legacy"}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert!(
+            record.disks.is_empty(),
+            "a record predating --disk has none"
+        );
+
+        let mut record = VmRecord::new("db".to_string(), 2, 512, vec![], vec![], false);
+        record.disks = vec![
+            crate::data::disk::AttachedDisk {
+                path: std::path::PathBuf::from("/dev/nvme1n1"),
+                read_only: false,
+            },
+            crate::data::disk::AttachedDisk {
+                path: std::path::PathBuf::from("/srv/golden.img"),
+                read_only: true,
+            },
+        ];
+        let decoded: VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.disks, record.disks, "order and mode are preserved");
+        assert_eq!(
+            decoded.vm_resources().disks,
+            record.disks,
+            "and they reach the launcher through vm_resources()"
+        );
+    }
+
+    #[test]
+    fn block_io_defaults_to_sync_and_round_trips_async() {
+        let legacy = r#"{"name":"legacy"}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.block_io, crate::data::resources::BlockIoEngine::Sync);
+
+        let mut record = VmRecord::new("queued".to_string(), 2, 512, vec![], vec![], false);
+        record.block_io = crate::data::resources::BlockIoEngine::Async;
+        let decoded: VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.block_io, record.block_io);
+        assert_eq!(decoded.vm_resources().block_io, record.block_io);
+    }
+
     #[test]
     fn test_vm_record_gpu_field() {
         // GPU defaults to None (not set)
@@ -1429,6 +1615,8 @@ mod tests {
     fn held_fork_state_roundtrips_and_legacy_records_default_released() {
         let mut record = VmRecord::new("slot-0".to_string(), 2, 1024, vec![], vec![], false);
         record.golden = Some("golden".to_string());
+        record.fork_overlay_owner = Some("root".to_string());
+        record.host_uid_owner = Some("local-restore".to_string());
         record.forkpoint_held = true;
         record.fork_env = vec![("SMOLVM_FORK_INDEX".to_string(), "0".to_string())];
 
@@ -1436,14 +1624,23 @@ mod tests {
         let decoded: VmRecord = serde_json::from_value(encoded.clone()).unwrap();
         assert!(decoded.forkpoint_held);
         assert_eq!(decoded.fork_env, record.fork_env);
+        assert_eq!(decoded.fork_overlay_owner.as_deref(), Some("root"));
+        assert_eq!(decoded.vm_uid_owner(), Some("local-restore"));
+        let mut child = decoded.clone();
+        child.name = "nested".to_string();
+        child.golden = Some(decoded.name.clone());
+        assert_eq!(child.vm_uid_owner(), Some("local-restore"));
 
         let mut legacy_value = encoded;
         let legacy_object = legacy_value.as_object_mut().unwrap();
         legacy_object.remove("forkpoint_held");
         legacy_object.remove("fork_env");
+        legacy_object.remove("fork_overlay_owner");
+        legacy_object.remove("host_uid_owner");
         let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
         assert!(!legacy.forkpoint_held);
         assert!(legacy.fork_env.is_empty());
+        assert!(legacy.fork_overlay_owner.is_none());
     }
 
     #[test]

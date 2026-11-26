@@ -18,6 +18,38 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One S3-compatible bucket to mount inside the workload container.
+///
+/// Structured rather than a shell command: the agent mounts it natively, so
+/// nothing has to be installed in the image and no command is interpolated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct S3Volume {
+    /// Service endpoint, e.g. `https://s3.us-east-1.amazonaws.com` or a
+    /// self-hosted `http://minio:9000`.
+    pub endpoint: String,
+    /// Region used for request signing.
+    pub region: String,
+    /// Bucket to mount.
+    pub bucket: String,
+    /// Optional key prefix, so a mount can expose one sub-tree of a bucket.
+    #[serde(default)]
+    pub prefix: String,
+    /// Absolute path inside the container where the bucket appears.
+    pub mountpoint: String,
+    /// Mount read-only; the kernel then rejects writes before they reach us.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Access key. Absent (with the secret) means anonymous access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Secret key paired with `access_key_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+    /// Session token, when temporary credentials are in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+}
+
 pub mod forkpoint;
 pub mod guest_env;
 pub mod image_ref;
@@ -51,6 +83,9 @@ pub mod base64_bytes {
 
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The agent can freeze internal filesystems before acknowledging shutdown.
+pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
 
 /// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
 /// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
@@ -222,6 +257,57 @@ pub struct FsNotifyEvent {
 // Agent Protocol (OCI Operations)
 // ============================================================================
 
+fn shutdown_progress_disabled(progress: &bool) -> bool {
+    !progress
+}
+
+#[cfg(test)]
+mod shutdown_compat_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shutdown_wire_shape_is_unchanged() {
+        let wire = r#"{"method":"shutdown"}"#;
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(wire).unwrap(),
+            AgentRequest::Shutdown { progress: false }
+        ));
+        assert_eq!(
+            serde_json::to_string(&AgentRequest::Shutdown { progress: false }).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn older_agent_can_accept_opt_in_request() {
+        #[derive(Deserialize)]
+        #[serde(tag = "method", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Shutdown,
+        }
+        let wire = serde_json::to_string(&AgentRequest::Shutdown { progress: true }).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
+            LegacyRequest::Shutdown
+        ));
+    }
+
+    #[test]
+    fn traced_shutdown_preserves_progress_opt_in() {
+        let envelope = Envelope::with_trace_id(
+            AgentRequest::Shutdown { progress: true },
+            Some("shutdown-test".into()),
+        );
+        let decoded: Envelope<AgentRequest> =
+            decode_message(&encode_message(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            decoded.body,
+            AgentRequest::Shutdown { progress: true }
+        ));
+        assert_eq!(decoded.trace_id.as_deref(), Some("shutdown-test"));
+    }
+}
+
 /// Agent request types (for image management and OCI operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -301,6 +387,28 @@ pub enum AgentRequest {
     /// Get storage disk status.
     StorageStatus,
 
+    /// Report the guest's own view of machine memory, read from
+    /// `/proc/meminfo`, plus its cumulative OOM-kill counter from
+    /// `/proc/vmstat`.
+    ///
+    /// The host cannot answer this. macOS charges the VMM's `phys_footprint`
+    /// as `internal + compressed`, and the compressed part is counted at the
+    /// pages' *uncompressed* size, so an idle guest whose memory has been
+    /// compressed reports a footprint several times the bytes it actually
+    /// occupies. Only the guest's allocator knows what the machine is using.
+    MemoryStatus,
+
+    /// Report the persistent image workload's observable lifecycle state.
+    ///
+    /// Detached OCI workloads do not leave a wait handle with the agent, so
+    /// an exited workload can be identified but its exact exit status cannot
+    /// generally be recovered. The response leaves exit attribution unset
+    /// rather than guessing from a machine-wide OOM counter.
+    WorkloadStatus {
+        /// Owner of the persistent overlay associated with the workload.
+        persistent_overlay_id: String,
+    },
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     NetworkTest {
@@ -309,7 +417,11 @@ pub enum AgentRequest {
     },
 
     /// Shutdown the agent.
-    Shutdown,
+    Shutdown {
+        /// Opt into progress frames while storage is being synchronized.
+        #[serde(default, skip_serializing_if = "shutdown_progress_disabled")]
+        progress: bool,
+    },
 
     /// Export a layer as a tar archive.
     ///
@@ -338,8 +450,63 @@ pub enum AgentRequest {
         /// are dropped, so a caller may include a container overlay's upper dir
         /// without first checking whether the machine ever wrote to it.
         lowerdirs: Vec<String>,
-        /// Guest path to write the tar archive to.
-        output: String,
+        /// Guest path to write the tar archive to, or `None` to stream the
+        /// archive straight back as `DataChunk` responses.
+        ///
+        /// Streaming is what a large export wants. The flattened tar is as large
+        /// as the image it came from, so staging it in the guest means the disk
+        /// has to hold both the expanded rootfs and a second full copy of it as
+        /// an archive — the export sizes that disk by guessing, and a big enough
+        /// image runs it out of space.
+        #[serde(default)]
+        output: Option<String>,
+    },
+
+    /// Wait until the workload has declared a branchpoint, returning the ready
+    /// marker's contents (its profile lines) in `data.contents`.
+    BranchpointWait {
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
+    },
+    /// Put a negotiated helper into its restore-safe loop before capture.
+    BranchpointArm,
+    /// Return a parked source to its ordinary wait after capture.
+    BranchpointPark,
+    /// Release a restored clone: write the release marker for the generation
+    /// recorded in its ready marker, carrying the clone's identity, and wait
+    /// for the helper to acknowledge.
+    BranchpointRelease {
+        /// The clone's parameters in dotenv form, appended to the marker.
+        #[serde(default)]
+        env_dotenv: Option<String>,
+    },
+    /// Assign and release a held clone in one idempotent step: claim it with
+    /// `activation_token` (a retry with the same token completes a partial
+    /// commit; a different token is refused), install the per-clone
+    /// parameters, then write the release marker.
+    BranchpointActivate {
+        /// Per-clone parameters, dotenv form, written to `env_path`.
+        env_dotenv: String,
+        /// The same parameters in shell-sourceable form, written to `branch_env_path`.
+        env_sourceable: String,
+        /// Guest path of the dotenv file (under the clone's overlay for image machines).
+        env_path: String,
+        /// Guest path of the sourceable file.
+        branch_env_path: String,
+        /// Directory that must already exist, typically the clone's merged
+        /// overlay root; activation refuses rather than fabricating it.
+        require_dir: Option<String>,
+        /// Directory to create before writing the env files.
+        env_dir: String,
+        /// Token identifying this activation attempt.
+        activation_token: String,
+    },
+    /// Wait until a released clone's workload publishes its worker-ready token.
+    BranchpointWaitWorkerReady {
+        /// The token the workload must publish; any other is a mismatch.
+        token: String,
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
     },
 
     /// Execute a command directly in the VM (not in a container).
@@ -432,6 +599,11 @@ pub enum AgentRequest {
         /// Incompatible with `interactive` and `tty`.
         #[serde(default)]
         background: bool,
+        /// S3 volumes to mount into the workload container. The agent mounts
+        /// them between `crun create` and `crun start`, so the workload's first
+        /// instruction already sees them and its command is never rewritten.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        s3_volumes: Vec<S3Volume>,
     },
 
     /// Send stdin data to a running interactive command.
@@ -519,6 +691,24 @@ pub enum AgentRequest {
     /// Read a file from the VM.
     FileRead {
         /// Absolute path in the VM filesystem.
+        path: String,
+    },
+
+    /// List the entries of a guest directory.
+    ///
+    /// Kept separate from [`AgentRequest::FileRead`], which streams bytes: a
+    /// listing is small and structured, and a caller that has to discover what
+    /// exists would otherwise guess names and read a 404 for each miss.
+    ListDirectory {
+        /// Absolute directory path in the VM filesystem.
+        path: String,
+    },
+
+    /// Stream a tar archive of a guest directory without creating a guest-side
+    /// temporary file. Used by staged mounts to batch many small files across
+    /// vsock instead of paying one virtiofs round trip per file.
+    ArchiveDirectory {
+        /// Absolute directory path in the VM filesystem.
         path: String,
     },
 
@@ -636,13 +826,21 @@ impl AgentRequest {
             AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
+            AgentRequest::MemoryStatus => "MemoryStatus".into(),
+            AgentRequest::WorkloadStatus { .. } => "WorkloadStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
-            AgentRequest::Shutdown => "Shutdown".into(),
+            AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
             AgentRequest::FlattenLayers { lowerdirs, .. } => {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
             }
             AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
+            AgentRequest::BranchpointArm => "BranchpointArm".into(),
+            AgentRequest::BranchpointPark => "BranchpointPark".into(),
+            AgentRequest::BranchpointRelease { .. } => "BranchpointRelease".into(),
+            AgentRequest::BranchpointActivate { .. } => "BranchpointActivate".into(),
+            AgentRequest::BranchpointWaitWorkerReady { .. } => "BranchpointWaitWorkerReady".into(),
             AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
             AgentRequest::Stdin { .. } => "Stdin".into(),
             AgentRequest::Resize { .. } => "Resize".into(),
@@ -650,6 +848,8 @@ impl AgentRequest {
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
+            AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
             // Pod requests: spec/process JSON may carry env secrets — emit ids only.
             AgentRequest::PodCreate { id, .. } => format!("PodCreate {{ id: {id} }}"),
             AgentRequest::PodStart { id, exec_id } => match exec_id {
@@ -670,6 +870,23 @@ impl AgentRequest {
             },
         }
     }
+}
+
+/// One entry of a [`AgentRequest::ListDirectory`] result.
+///
+/// Deliberately small: a name, what it is, and a size. A caller discovering a
+/// tree wants to know where to recurse and what is worth downloading, and
+/// anything richer invites the listing being used as a stat cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    /// Entry name, not a path: no separators, relative to the directory listed.
+    pub name: String,
+    /// `"file"`, `"dir"`, `"symlink"`, or `"other"` for sockets, devices and
+    /// fifos, which a caller can see but should not try to download.
+    pub kind: String,
+    /// Size in bytes. Zero for anything that is not a regular file.
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// Agent response types.
@@ -974,6 +1191,81 @@ pub struct OverlayInfo {
     pub work_path: String,
 }
 
+/// The guest's own account of machine memory, from `/proc/meminfo`.
+///
+/// This is what a machine is actually using. The host-side `phys_footprint`
+/// answers a different question — it counts compressed pages at their
+/// uncompressed size and keeps counting memory the guest has stopped needing —
+/// so it runs well above these figures and should not be read as consumption.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryStatus {
+    /// Total usable RAM the guest sees, in bytes. Slightly below the machine's
+    /// configured size: the kernel reserves some before the allocator sees it.
+    pub total_bytes: u64,
+    /// Memory available for new allocations without swapping, in bytes. The
+    /// figure to report, since `free_bytes` excludes reclaimable page cache.
+    pub available_bytes: u64,
+    /// Free memory in bytes: never allocated, or released and not reused.
+    pub free_bytes: u64,
+    /// Page cache in bytes. Counted inside `available_bytes`.
+    pub cached_bytes: u64,
+    /// Block-device buffers in bytes. Counted inside `available_bytes`.
+    #[serde(default)]
+    pub buffers_bytes: u64,
+    /// Swap configured in the guest, in bytes. Zero when the guest has none.
+    pub swap_total_bytes: u64,
+    /// Swap in use, in bytes.
+    pub swap_used_bytes: u64,
+    /// Machine-wide cumulative OOM kills since this kernel booted, from
+    /// `/proc/vmstat`'s `oom_kill` counter. `None` means the running guest
+    /// predates this field or its kernel does not publish the counter; it must
+    /// not be treated as zero by a recovery controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kill_count: Option<u64>,
+}
+
+impl MemoryStatus {
+    /// Memory the guest cannot hand back on demand.
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.available_bytes)
+    }
+}
+
+/// Observable state of the persistent image workload inside a machine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadState {
+    /// The OCI workload process is currently alive.
+    Running,
+    /// A persisted workload identity exists, but its process is no longer alive.
+    Exited,
+    /// No workload identity is available (never launched, cleaned up, or an
+    /// older guest that did not retain it).
+    Unknown,
+}
+
+/// Persistent workload diagnostics returned by [`AgentRequest::WorkloadStatus`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadStatus {
+    /// Lifecycle state that can be established from crun's persisted process
+    /// identity and `/proc` with PID-reuse protection.
+    pub state: WorkloadState,
+    /// Exact exit code when the lifecycle owns a wait handle. Detached OCI
+    /// workloads currently do not, so this remains `None` after they exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    /// Exact structured exit reason when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_reason: Option<String>,
+    /// Exact workload-specific OOM attribution when available. A machine-wide
+    /// `oom_kill` increment is deliberately insufficient evidence, so detached
+    /// OCI workloads report `None`, not a guessed boolean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_killed: Option<bool>,
+}
+
 /// Storage status information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
@@ -1249,6 +1541,31 @@ mod tests {
     }
 
     #[test]
+    fn flatten_layers_output_is_optional() {
+        // A client predating streaming always names a guest path to stage the
+        // archive at, and must keep deserializing.
+        let staged =
+            r#"{"method":"flatten_layers","lowerdirs":["/a","/b"],"output":"/storage/x.tar"}"#;
+        let req: AgentRequest = serde_json::from_str(staged).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { lowerdirs, output } => {
+                assert_eq!(lowerdirs, vec!["/a".to_string(), "/b".to_string()]);
+                assert_eq!(output, Some("/storage/x.tar".to_string()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Omitting it asks the agent to stream the archive back instead, which is
+        // what keeps a large export from needing room for a second full copy.
+        let streamed = r#"{"method":"flatten_layers","lowerdirs":["/a","/b"]}"#;
+        let req: AgentRequest = serde_json::from_str(streamed).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { output, .. } => assert_eq!(output, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_encode_decode_roundtrip() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
@@ -1367,11 +1684,11 @@ mod tests {
     fn test_agent_response_serialization() {
         let resp = AgentResponse::Pong {
             version: PROTOCOL_VERSION,
-            capabilities: vec![forkpoint::WORKER_READY_CAPABILITY.to_string()],
+            capabilities: vec![forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pong"));
-        assert!(json.contains(forkpoint::WORKER_READY_CAPABILITY));
+        assert!(json.contains(forkpoint::TYPED_BRANCHPOINT_CAPABILITY));
 
         let legacy: AgentResponse =
             serde_json::from_str(r#"{"status":"pong","version":1}"#).unwrap();
@@ -1390,6 +1707,40 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("progress"));
+    }
+
+    #[test]
+    fn legacy_memory_status_defaults_new_diagnostics() {
+        let legacy = r#"{
+            "totalBytes": 4096,
+            "availableBytes": 2048,
+            "freeBytes": 1024,
+            "cachedBytes": 512,
+            "swapTotalBytes": 0,
+            "swapUsedBytes": 0
+        }"#;
+        let status: MemoryStatus = serde_json::from_str(legacy).unwrap();
+        assert_eq!(status.buffers_bytes, 0);
+        assert_eq!(status.oom_kill_count, None);
+
+        let encoded = serde_json::to_value(status).unwrap();
+        assert_eq!(encoded["buffersBytes"], 0);
+        assert!(encoded.get("oomKillCount").is_none());
+    }
+
+    #[test]
+    fn workload_status_preserves_unknown_oom_attribution() {
+        let status = WorkloadStatus {
+            state: WorkloadState::Exited,
+            last_exit_code: None,
+            last_exit_reason: None,
+            oom_killed: None,
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["state"], "exited");
+        assert!(encoded.get("oomKilled").is_none());
+        let decoded: WorkloadStatus = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, status);
     }
 
     #[test]

@@ -331,6 +331,188 @@ pub enum PackMode {
     Vm,
 }
 
+/// One integrity-protected file belonging to a portable live checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAsset {
+    /// Relative path within the artifact assets.
+    pub path: String,
+    /// Uncompressed byte length.
+    pub size: u64,
+    /// Lowercase SHA-256 digest of the file contents. Empty for sparse memory
+    /// or block files whose integrity is provided by the pack container.
+    pub sha256: String,
+}
+
+/// One file in a checkpoint's portable block-image chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointDiskFile {
+    /// Integrity metadata and artifact-relative source path.
+    pub asset: CheckpointAsset,
+    /// Safe filename installed in the machine data directory.
+    pub target: String,
+    /// `raw` or `qcow2`.
+    pub format: String,
+}
+
+/// An exact block-image chain captured for one virtual disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointDisk {
+    /// Stable disk role: `storage` or `overlay`.
+    pub role: String,
+    /// Ordered top-to-base chain. The first file is the disk attached to the VM.
+    pub files: Vec<CheckpointDiskFile>,
+}
+
+/// Container workload identity needed after a live checkpoint is restored.
+///
+/// The running container itself is present in guest RAM. These fields are for
+/// host-side routing (`machine exec`) and for launching the same persistent
+/// workload exactly once after a later ordinary stop/start cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointWorkload {
+    /// OCI image identity used by the persistent workload.
+    pub image: String,
+    /// Container user resolved from the image or supplied by the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Persistent overlay identifier containing the restored container state.
+    ///
+    /// A checkpoint may be restored under a different machine name, but the
+    /// live overlay mount and crun state retain the identifier used at capture.
+    pub overlay_owner: String,
+    /// Restart policy to apply after the live checkpoint has been consumed.
+    pub restart_policy: String,
+    /// Maximum automatic restart attempts (`0` means unlimited).
+    #[serde(default)]
+    pub restart_max_retries: u32,
+    /// Maximum restart backoff in seconds (`0` selects the runtime default).
+    #[serde(default)]
+    pub restart_max_backoff_secs: u64,
+}
+
+/// One host-to-guest TCP forward restored around a live VM.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPort {
+    /// Host TCP port on the restoring node.
+    pub host: u16,
+    /// Guest TCP port reached by the host listener.
+    pub guest: u16,
+}
+
+/// Re-creatable host networking attached to a live checkpoint.
+///
+/// Open host sockets are deliberately not serialized. The target recreates
+/// the same virtual network device and fresh host listeners before resuming
+/// the captured guest; pre-existing external connections may be lost.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CheckpointNetwork {
+    /// Whether the captured VM had a network backend attached.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Host listeners to recreate around the restored VM.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<CheckpointPort>,
+    /// Effective backend used at capture: `tsi` or `virtio-net`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Custom IPv4 DNS resolver, when one was explicitly configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<String>,
+    /// Named local inter-VM network joined by the captured machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
+    /// Captured outbound CIDR allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Captured outbound DNS hostname allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_filter_hosts: Option<Vec<String>>,
+}
+
+/// Versioned host CPU compatibility contract for a live checkpoint.
+///
+/// A recognized contract permits a restore on a different CPU model while the
+/// hypervisor remains the final authority for applying the captured
+/// architectural CPU state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CheckpointCpuContract {
+    /// Stable Haswell-era Intel/KVM virtual CPU profile. The source VM ran
+    /// under this profile from its first instruction, so host-specific extended
+    /// state cannot leak into a live checkpoint.
+    LinuxKvmIntelPortableV1,
+    /// Platforms without a hypervisor-level compatibility check require the
+    /// exact source CPU feature fingerprint.
+    ExactV1 {
+        /// Hash of the host CPU virtualization feature contract.
+        fingerprint: String,
+    },
+    /// The architectural features the source guest was given, by name.
+    ///
+    /// aarch64 has no equivalent of the x86 `KVM_SET_CPUID2` check: the guest is
+    /// handed the host's own ID registers (libkrun only ORs in EL2/GICv3 and
+    /// masks out SME), and nothing compares them on restore. So a guest that
+    /// probed the source CPU at boot carries those conclusions in its restored
+    /// memory, and meeting an instruction the destination does not implement is
+    /// an undefined-instruction fault inside the guest rather than a clean
+    /// refusal.
+    ///
+    /// Recording the set by NAME replaces an opaque equality hash with a
+    /// question that can actually be answered: does this host provide
+    /// everything the guest was told it had? A destination that does is
+    /// accepted even if its model differs; one that does not is refused with
+    /// the missing features named.
+    Aarch64FeaturesV1 {
+        /// Sorted, de-duplicated `FEAT_*` names the source guest could use.
+        features: Vec<String>,
+    },
+}
+
+/// Compatibility and payload metadata for a portable live checkpoint.
+///
+/// The pack container itself is portable storage; live CPU/device state is
+/// deliberately accepted only by a runtime with the same checkpoint ABI,
+/// architecture, CPU contract, and device profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortableCheckpointManifest {
+    /// Version of this metadata contract.
+    pub version: u32,
+    /// Exact libkrun checkpoint-state ABI required by this artifact.
+    pub runtime_abi: String,
+    /// Host OS and architecture that captured the live state.
+    pub host_platform: String,
+    /// Versioned CPU migration contract.
+    pub cpu_contract: CheckpointCpuContract,
+    /// Number of virtual CPUs in the captured machine.
+    pub cpus: u8,
+    /// Configured guest memory in MiB.
+    pub memory_mib: u32,
+    /// Effective persistent storage size in GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gib: Option<u64>,
+    /// Effective writable overlay size in GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_gib: Option<u64>,
+    /// Stable identifier for the captured virtual device topology.
+    pub device_profile: String,
+    /// Serialized VM, vCPU, and device state.
+    pub state: CheckpointAsset,
+    /// Eager guest-memory image.
+    pub memory: CheckpointAsset,
+    /// Guest physical-memory layout manifest.
+    pub layout: CheckpointAsset,
+    /// Exact block-image chains from the same paused boundary as RAM.
+    #[serde(default)]
+    pub disks: Vec<CheckpointDisk>,
+    /// Persistent container identity. Absent on version-one bare-VM
+    /// checkpoints and on checkpoints captured from an imageless machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<CheckpointWorkload>,
+    /// Host networking reconstructed around the restored VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<CheckpointNetwork>,
+}
+
 /// Manifest describing the packed image and configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackManifest {
@@ -369,6 +551,10 @@ pub struct PackManifest {
     /// Working directory (from image config or override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// User the workload runs as (name or `uid[:gid]`), when the machine was
+    /// given one; absent means the image's USER applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     /// Default number of vCPUs.
     pub cpus: u8,
@@ -416,6 +602,10 @@ pub struct PackManifest {
 
     /// Asset inventory - files included in the assets blob.
     pub assets: AssetInventory,
+
+    /// Live execution state when this artifact is a `.smolcheckpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<PortableCheckpointManifest>,
 }
 
 /// Inventory of assets included in the packed binary.
@@ -435,6 +625,14 @@ pub struct AssetInventory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_template: Option<AssetEntry>,
 
+    /// Original sparse size of a VM-mode storage disk, in bytes.
+    ///
+    /// Like the root overlay, a stopped VM's storage disk is packed without its
+    /// trailing hole and must be extended to this size before it is used as a
+    /// raw backing disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_logical_size: Option<u64>,
+
     /// Overlay disk template (optional, VM mode only).
     /// Contains the VM's persistent rootfs state from a `--from-vm` pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +645,11 @@ pub struct AssetInventory {
     /// this size via `ftruncate`, restoring the sparse skeleton the VM expects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_logical_size: Option<u64>,
+    /// Contents of the machine's `/workspace` at pack time, as a tar the guest
+    /// unpacks onto a fresh storage disk on first boot. Absent from packs made
+    /// without `--include-workspace`, and from packs older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_seed: Option<AssetEntry>,
 }
 
 /// An asset file entry.
@@ -492,6 +695,7 @@ impl PackManifest {
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
+            user: None,
             cpus: 1,
             mem: 256,
             image_size: 0,
@@ -509,9 +713,12 @@ impl PackManifest {
                 },
                 layers: Vec::new(),
                 storage_template: None,
+                storage_logical_size: None,
                 overlay_template: None,
                 overlay_logical_size: None,
+                workspace_seed: None,
             },
+            checkpoint: None,
         }
     }
 

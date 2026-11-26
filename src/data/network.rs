@@ -42,6 +42,40 @@ pub fn default_dns_addr() -> IpAddr {
     host_dns()
 }
 
+/// Select the virtio gateway's upstream once per VM start. Queries originate
+/// on the host, so local DNS servers such as WireGuard's 127.* addresses work.
+/// A missing system IPv4 resolver is an error, never a public-DNS substitution.
+#[cfg(target_os = "macos")]
+pub fn forwarded_dns(custom: Option<Ipv4Addr>) -> std::io::Result<Ipv4Addr> {
+    forwarded_dns_from_resolv(std::path::Path::new("/etc/resolv.conf"), custom)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn forwarded_dns_from_resolv(
+    path: &std::path::Path,
+    custom: Option<Ipv4Addr>,
+) -> std::io::Result<Ipv4Addr> {
+    if let Some(server) = custom {
+        return Ok(server);
+    }
+    let contents = std::fs::read_to_string(path)?;
+    for line in contents.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("nameserver") {
+            if let Some(server) = words
+                .next()
+                .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            {
+                return Ok(server);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "System DNS has no configured IPv4 nameserver; configure one or use --dns <IPv4>",
+    ))
+}
+
 /// TCP port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
@@ -49,6 +83,27 @@ pub struct PortMapping {
     pub host: u16,
     /// Port inside the guest.
     pub guest: u16,
+}
+
+/// Maximum concrete mappings permitted for one machine.
+///
+/// The current forwarding implementation starts listener thread(s) per mapping,
+/// so raising this limit requires multiplexing listeners or bounding the worker
+/// pool in `smolvm-network` first.
+pub const MAX_PORT_MAPPINGS: usize = 64;
+
+/// A CLI or Smolfile port mapping before range expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMappingSpec {
+    host: PortRange,
+    guest: PortRange,
+}
+
+/// An inclusive range of TCP ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortRange {
+    start: u16,
+    end: u16,
 }
 
 /// Check if any CIDR in the list covers the given IP address.
@@ -95,6 +150,105 @@ pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
     if !cidrs_contain_ip(cidrs, &dns.to_string()) {
         cidrs.push(IpNet::from(dns).to_string());
     }
+}
+
+impl From<PortMapping> for PortMappingSpec {
+    fn from(mapping: PortMapping) -> Self {
+        let range = PortRange {
+            start: mapping.host,
+            end: mapping.host,
+        };
+        Self {
+            host: range,
+            guest: PortRange {
+                start: mapping.guest,
+                end: mapping.guest,
+            },
+        }
+    }
+}
+
+impl PortMappingSpec {
+    /// Parse a port mapping specification (`HOST:GUEST`, `PORT`, or equal-length ranges).
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let (host, guest) = match spec.split_once(':') {
+            Some((host, guest)) => (
+                PortRange::parse(host, "host")?,
+                PortRange::parse(guest, "guest")?,
+            ),
+            None => {
+                let range = PortRange::parse(spec, "")?;
+                (range, range)
+            }
+        };
+
+        if host.len() != guest.len() {
+            return Err(format!(
+                "host and guest port ranges must have the same number of ports: {spec}"
+            ));
+        }
+
+        Ok(Self { host, guest })
+    }
+
+    /// Expand all user-supplied specs while enforcing the per-machine mapping cap.
+    pub fn expand_all(specs: &[Self]) -> Result<Vec<PortMapping>, String> {
+        let count = specs.iter().map(|spec| spec.host.len() as usize).sum();
+        if count > MAX_PORT_MAPPINGS {
+            return Err(format!(
+                "port mappings expand to {count} entries; the maximum per machine is {MAX_PORT_MAPPINGS}"
+            ));
+        }
+
+        let mut ports = Vec::with_capacity(count);
+        for spec in specs {
+            ports.extend(
+                (spec.host.start..=spec.host.end)
+                    .zip(spec.guest.start..=spec.guest.end)
+                    .map(|(host, guest)| PortMapping::new(host, guest)),
+            );
+        }
+        Ok(ports)
+    }
+}
+
+impl PortRange {
+    fn parse(spec: &str, kind: &str) -> Result<Self, String> {
+        let (start, end) = match spec.split_once('-') {
+            Some((start, end)) => (parse_port(start, kind)?, parse_port(end, kind)?),
+            None => {
+                let port = parse_port(spec, kind)?;
+                (port, port)
+            }
+        };
+
+        if start > end {
+            return Err(format!(
+                "{kind} port range start must not exceed its end: {spec}"
+            ));
+        }
+
+        Ok(Self { start, end })
+    }
+
+    const fn len(self) -> u32 {
+        self.end as u32 - self.start as u32 + 1
+    }
+}
+
+fn parse_port(spec: &str, kind: &str) -> Result<u16, String> {
+    let label = if kind.is_empty() {
+        "port".to_string()
+    } else {
+        format!("{kind} port")
+    };
+    let port: u16 = spec
+        .parse()
+        .map_err(|_| format!("invalid {label}: {spec}"))?;
+    if port == 0 {
+        return Err(format!("{label} 0 is not valid for VM port forwarding"));
+    }
+    Ok(port)
 }
 
 impl PortMapping {
@@ -166,6 +320,53 @@ impl PortMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarded_dns_accepts_loopback_and_refreshes_on_each_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resolv.conf");
+        std::fs::write(
+            &path,
+            "# DNS configuration\n nameserver 127.0.2.2 # tunnel\nnameserver 127.0.2.3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, None).unwrap(),
+            Ipv4Addr::new(127, 0, 2, 2)
+        );
+        std::fs::write(&path, "nameserver 192.168.1.1\n").unwrap();
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, None).unwrap(),
+            Ipv4Addr::new(192, 168, 1, 1)
+        );
+    }
+
+    #[test]
+    fn forwarded_dns_never_substitutes_a_public_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resolv.conf");
+        let custom = Ipv4Addr::new(10, 20, 30, 40);
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, Some(custom)).unwrap(),
+            custom
+        );
+        assert_eq!(
+            forwarded_dns_from_resolv(&path, None).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        for contents in [
+            "",
+            "nameserver ::1\n",
+            "nameserver invalid\n",
+            "nameserver-prefix 1.1.1.1\n",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(
+                forwarded_dns_from_resolv(&path, None).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     #[test]
     fn test_cidrs_contain_ip() {
@@ -248,6 +449,53 @@ mod tests {
         assert!(PortMapping::parse("0").is_err());
         assert!(PortMapping::parse("1:1").is_ok());
         assert!(PortMapping::parse("8080:80").is_ok());
+    }
+
+    #[test]
+    fn port_mapping_spec_expands_equal_length_ranges() {
+        let spec = PortMappingSpec::parse("5173-5175:6173-6175").unwrap();
+        let ports = PortMappingSpec::expand_all(&[spec]).unwrap();
+
+        assert_eq!(
+            ports,
+            vec![
+                PortMapping::new(5173, 6173),
+                PortMapping::new(5174, 6174),
+                PortMapping::new(5175, 6175),
+            ]
+        );
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_mismatched_range_lengths() {
+        assert!(PortMappingSpec::parse("5173-5175:6173-6174").is_err());
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_descending_ranges() {
+        assert!(PortMappingSpec::parse("5175-5173").is_err());
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_zero_in_ranges() {
+        assert!(PortMappingSpec::parse("0-1").is_err());
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_malformed_ranges() {
+        assert!(PortMappingSpec::parse("5173--5175").is_err());
+    }
+
+    #[test]
+    fn port_mapping_spec_limits_total_expanded_mappings() {
+        let specs = [
+            PortMappingSpec::parse("1-32").unwrap(),
+            PortMappingSpec::parse("33-64").unwrap(),
+        ];
+        assert_eq!(PortMappingSpec::expand_all(&specs).unwrap().len(), 64);
+
+        let too_many = [PortMappingSpec::parse("1-65").unwrap()];
+        assert!(PortMappingSpec::expand_all(&too_many).is_err());
     }
 
     #[test]

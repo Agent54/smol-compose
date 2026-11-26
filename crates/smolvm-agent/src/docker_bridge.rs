@@ -82,10 +82,9 @@ fn run_bridge() -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn relay_to_daemon(host_conn: crate::vsock::VsockStream) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    use std::os::unix::net::UnixStream;
 
     let mut host = host_conn;
-    let mut daemon = UnixStream::connect(GUEST_DOCKER_SOCK)?;
+    let mut daemon = crate::publish_socket::dial_app(GUEST_DOCKER_SOCK)?;
 
     let host_fd = host.as_raw_fd();
     let daemon_fd = daemon.as_raw_fd();

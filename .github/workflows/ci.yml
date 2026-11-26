@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, compose]
   workflow_call:
 
 env:
@@ -28,7 +28,7 @@ jobs:
     name: Secrets invariants
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Check secrets guardrails
         run: ./scripts/check-secrets-guards.sh
 
@@ -38,7 +38,7 @@ jobs:
     steps:
       # LFS on: check-krun-exports.sh reads the actual bundled lib binaries.
       # (check-libkrun-provenance.sh itself only needs the pinned gitlinks.)
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           lfs: true
       - name: Bundled libkrun matches the pinned submodule
@@ -63,7 +63,7 @@ jobs:
     # .cargo/audit.toml, which ignores documented unmaintained-transitive notices
     # so a real vulnerability stands out instead of hiding in warning noise.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
@@ -73,7 +73,7 @@ jobs:
   # ==========================================================================
   macos:
     name: macOS (arm64)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
 
@@ -410,10 +410,10 @@ jobs:
 
   # ==========================================================================
   # Downstream compatibility: the smol CLI builds this workspace via path deps
-  # (`smolvm = { path = ".." }`) and releases in version lockstep, so an engine
-  # API change that breaks smol otherwise surfaces only at release time (as
-  # with the LaunchConfig `published_sockets` field). Compile smol's main
-  # against this PR so the break fails HERE, before merge.
+  # (`smolvm = { path = ".." }`). This fork stays on the 1.16.2 engine API;
+  # upstream smol main now requires newer APIs. Keep checking the revision
+  # used by the last passing Compose CI run (35511134961), and update this
+  # pin together with any intentional engine API upgrade.
   # ==========================================================================
   smol-compat:
     name: smol CLI compatibility
@@ -423,16 +423,17 @@ jobs:
         with:
           lfs: false
 
-      - name: Checkout smol (main) into the monorepo
+      - name: Checkout compatible smol into the monorepo
         uses: actions/checkout@v6
         with:
           repository: smol-machines/smol
+          ref: 65aecb2b2783db1d25202167b8feab92fe6027b9
           path: smol
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/

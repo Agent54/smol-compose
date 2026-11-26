@@ -1,0 +1,23 @@
+# Docker Compose backend evaluation and distributable image definition.
+#
+# Docker manages its own containerd, whose image store lives beneath Docker's
+# data-root on the persistent disk. The official entrypoint starts Docker on
+# each VM boot. BuildKit starts separately, only on a build request.
+
+image = "docker:29.9.3-dind@sha256:ad3c03cf98cb790e69b7aedd29d0406646945f2b2bc01910efddecda0db5d24d"
+entrypoint = ["/usr/local/bin/dockerd-entrypoint.sh"]
+cmd = [
+    # Supplying `dockerd` explicitly prevents the DinD entrypoint from adding
+    # an unauthenticated TCP listener. The host reaches Docker only through
+    # the published Unix socket below.
+    "dockerd",
+    "--host=unix:///var/run/docker.sock",
+    "--data-root=/storage/docker",
+]
+env = ["DOCKER_TLS_CERTDIR=", "DOCKER_BUILDKIT=1", "DOCKER_CONFIG=/storage/xe-build-client"]
+
+cpus = 2
+memory = 2048
+net = true
+storage = 20
+overlay = 10

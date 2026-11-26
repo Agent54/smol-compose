@@ -122,7 +122,10 @@ install_packages_apk_static() {
     # Download Alpine's static apk binary — runs natively on Linux,
     # can install packages for any target architecture via --arch.
     APK_STATIC_MIRROR="${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/${HOST_ARCH}"
-    APK_STATIC_PKG=$(curl -fsSL "$APK_STATIC_MIRROR/" | grep -o 'apk-tools-static-[^"]*\.apk' | head -1)
+    # Read the complete index before selecting the first match. With pipefail,
+    # `grep | head -1` can fail with SIGPIPE as soon as head closes the pipe.
+    APK_STATIC_INDEX="$(curl -fsSL "$APK_STATIC_MIRROR/")"
+    APK_STATIC_PKG="$(grep -o 'apk-tools-static-[^"]*\.apk' <<<"$APK_STATIC_INDEX" | sed -n '1p' || true)"
     if [[ -z "$APK_STATIC_PKG" ]]; then
         echo "Error: could not find apk-tools-static package at $APK_STATIC_MIRROR"
         exit 1
@@ -307,11 +310,12 @@ mkdir -p "$OUTPUT_DIR/run"
 #   /mnt/overlay  OVERLAY_MOUNT       } setup_persistent_rootfs(), required at
 #   /mnt/storage  STORAGE_TEMP_MOUNT  } boot before the overlay is writable
 #   /mnt/newroot  NEWROOT             }
-#   /mnt/virtiofs paths::VIRTIOFS_MOUNT_ROOT  parent for per-tag virtiofs shares
+#   /run/smolvm/virtiofs paths::VIRTIOFS_MOUNT_ROOT  per-tag virtiofs staging
 #   /mnt/rosetta  vm::rosetta::ROSETTA_GUEST_PATH  macOS Rosetta binfmt share
-for mnt_dir in overlay storage newroot virtiofs rosetta; do
+for mnt_dir in overlay storage newroot rosetta; do
     mkdir -p "$OUTPUT_DIR/mnt/$mnt_dir"
 done
+mkdir -p "$OUTPUT_DIR/run/smolvm/virtiofs"
 
 # Install the pre-built Rosetta ptrace wrapper. This static binary intercepts
 # Rosetta's Virtualization.framework ioctl validation, allowing x86_64
@@ -472,6 +476,18 @@ if [[ -n "$CUDART_SHIM_SRC" && -f "$CUDART_SHIM_SRC" \
     fi
 else
     echo "Skipping CUDA guest shims (no prebuilt paths, cross-arch, or no cargo) — auto-staging disabled in this rootfs"
+fi
+
+# Vulkan (Venus) guest driver bundle: the patched Mesa virtio ICD plus its
+# shared-library closure and the Vulkan loader, pinned by URL + sha256. The
+# agent bind-mounts it into --gpu workload containers so stock glibc images
+# get working Vulkan with no setup (crates/smolvm-agent/src/vulkan.rs).
+# Best-effort: without it, --gpu still works in the manual-setup mode.
+if "$SCRIPT_DIR/fetch-vulkan-guest-driver.sh" "$ALPINE_ARCH" "$OUTPUT_DIR/usr/local/lib/smolvm-vulkan"; then
+    echo "Installed Vulkan guest driver bundle"
+else
+    echo "Vulkan guest driver fetch failed — rootfs ships without auto-staging"
+    rm -rf "$OUTPUT_DIR/usr/local/lib/smolvm-vulkan"
 fi
 
 # Last, so it covers every file the steps above installed — not just the Alpine base.

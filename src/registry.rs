@@ -89,10 +89,14 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
         PullAuth::Bearer(token) => client.with_token(token.clone()),
         PullAuth::Identity(token) => client.with_identity_token(token.clone()),
         PullAuth::FromConfig => {
-            let Some(entry) = config.registries.get(cred_key) else {
-                return client;
-            };
-            if let Some(identity_token) = &entry.identity_token {
+            let entry = config.registries.get(cred_key);
+            if let Some(identity_token) = entry.and_then(|e| e.identity_token.as_ref()) {
+                // A lapsed identity token makes the token service answer with a
+                // bare 401 that reads like a permissions problem — so a returning
+                // user whose short-lived credential expired hits a wall even on a
+                // public, anonymous-pullable image. Surface the real cause and the
+                // fix up front rather than letting the opaque 401 be the whole story.
+                warn_if_credential_expired(cred_key, entry.and_then(|e| e.expires_at));
                 client.with_identity_token(identity_token.clone())
             } else if let Some(cred) = config.get_credentials(cred_key) {
                 // Legacy convention: username "token" means the password IS the
@@ -102,11 +106,56 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
                 } else {
                     client.with_basic_credentials(cred.username, cred.password)
                 }
+            } else if let Some(cred) = crate::docker_config::credential_for(cred_key) {
+                // Nothing in smolvm's own config: fall back to what `docker login`
+                // stored, including credentials held by a credential helper.
+                // An identity token needs the OAuth refresh exchange this client
+                // does not speak, so only a username/secret pair is usable here.
+                if cred.is_identity_token() {
+                    tracing::debug!(registry = %cred_key, "docker identity token is not usable for the host-side registry client");
+                    client
+                } else {
+                    client.with_basic_credentials(cred.username, cred.secret)
+                }
             } else {
                 client
             }
         }
     }
+}
+
+/// Warn to stderr when a stored identity token has already expired. Pure aside
+/// from the `eprintln!`: the token is still attempted (the clock could be skewed,
+/// or the registry may honor a grace window), but the user gets the real reason
+/// and the two ways out before the opaque 401 lands. No-op when `expires_at` is
+/// absent (long-lived / non-expiring credential) or still in the future.
+fn warn_if_credential_expired(registry: &str, expires_at: Option<i64>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Some(msg) = expired_credential_warning(registry, expires_at, now) {
+        eprintln!("{msg}");
+    }
+}
+
+/// The warning text for an expired credential, or `None` when there's nothing to
+/// warn about (`expires_at` absent, or still in the future relative to `now`).
+/// Split out from the `eprintln!` so the decision + wording are unit-testable.
+fn expired_credential_warning(registry: &str, expires_at: Option<i64>, now: i64) -> Option<String> {
+    let exp = expires_at?;
+    if exp > now {
+        return None;
+    }
+    let when = humantime::format_rfc3339_seconds(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(exp.max(0) as u64),
+    );
+    Some(format!(
+        "warning: your saved credential for {registry} expired at {when} — the \
+         registry will likely reject it with a 401. Run `smol login` to refresh \
+         it, or remove the [machines.registries.\"{registry}\"] entry from your \
+         config to pull public images anonymously."
+    ))
 }
 
 /// Registry credentials and defaults for a set of OCI registries.
@@ -616,6 +665,24 @@ fn validate_digest(raw_input: &str, digest: &str) -> std::result::Result<(), Ref
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_credential_warning_fires_only_when_past() {
+        // No expiry recorded (long-lived credential) → never warns.
+        assert!(expired_credential_warning("registry.smolmachines.com", None, 1000).is_none());
+        // Still valid (expiry in the future) → no warning.
+        assert!(
+            expired_credential_warning("registry.smolmachines.com", Some(2000), 1000).is_none()
+        );
+        // Lapsed → an actionable warning naming the registry + both remedies.
+        let msg = expired_credential_warning("registry.smolmachines.com", Some(500), 1000)
+            .expect("an expired credential must warn");
+        assert!(msg.contains("registry.smolmachines.com"));
+        assert!(msg.contains("smol login"));
+        assert!(msg.contains("anonymously"));
+        // Exactly-at-expiry counts as expired (exp <= now).
+        assert!(expired_credential_warning("r", Some(1000), 1000).is_some());
+    }
 
     #[test]
     fn test_extract_registry_implicit_dockerhub() {

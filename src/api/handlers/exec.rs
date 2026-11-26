@@ -10,7 +10,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::convert::Infallible;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,8 +82,13 @@ pub async fn exec_command(
     if req.background {
         let command = req.command.clone();
         let workdir = req.workdir.clone();
+        let user = req.user.clone();
         let machine_rec = state.lookup_vm(&id).await?;
-        let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+        // An exec may be what establishes the workload container — the machine's
+        // command exited, or the image's own default was short-lived — and that
+        // container is where the mount lives, so the config has to target the
+        // machine rather than merely reuse its overlay.
+        let machine_for_run = machine_rec.clone();
         let machine_image = machine_rec.and_then(|r| r.image);
         let pid = if let Some(image) = machine_image {
             let mounts_config = {
@@ -94,19 +99,19 @@ pub async fn exec_command(
                     .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
                     .collect::<Vec<_>>()
             };
-            // A fork clone's inherited overlay lives under the golden's id
-            // (see `persistent_overlay_owner`).
-            let overlay_id =
-                crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
             with_machine_client_traced(&entry, tid, move |c| {
                 if c.query(&image)?.is_none() {
                     c.pull_with_registry_config(&image)?;
                 }
+                // The volumes are derived from the env the machine will see, so
+                // keep a copy before the builder consumes it.
+                let env_for_volumes = env.clone();
                 let config = crate::agent::RunConfig::new(image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user)
                     .with_mounts(mounts_config)
-                    .with_persistent_overlay(Some(overlay_id));
+                    .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
                 c.run_background(config)
             })
             .await?
@@ -130,6 +135,7 @@ pub async fn exec_command(
     // path); env precedence is req.env < record.secret_refs < req.secrets.
     let command = req.command.clone();
     let workdir = req.workdir.clone();
+    let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();
 
@@ -139,7 +145,11 @@ pub async fn exec_command(
     // etc.) — the image is never entered. Plain machines exec in the VM
     // directly via `vm_exec`.
     let machine_rec = state.lookup_vm(&id).await?;
-    let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+    // An exec may be what establishes the workload container — the machine's
+    // command exited, or the image's own default was short-lived — and that
+    // container is where the mount lives, so the config has to target the
+    // machine rather than merely reuse its overlay.
+    let machine_for_run = machine_rec.clone();
     let machine_image = machine_rec.and_then(|r| r.image);
 
     let start = std::time::Instant::now();
@@ -153,7 +163,6 @@ pub async fn exec_command(
                 .collect::<Vec<_>>()
         };
         // A fork clone's inherited overlay lives under the golden's id.
-        let overlay_id = crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
         let stdin_data = stdin_data.clone();
         with_machine_client_traced(&entry, tid, move |c| {
             // Pull only if the image isn't already present — avoids a registry
@@ -162,12 +171,14 @@ pub async fn exec_command(
             if c.query(&image)?.is_none() {
                 c.pull_with_registry_config(&image)?;
             }
+            let env_for_volumes = env.clone();
             let config = crate::agent::RunConfig::new(image, command)
                 .with_env(env)
                 .with_workdir(workdir)
+                .with_user(user)
                 .with_mounts(mounts_config)
                 .with_timeout(timeout)
-                .with_persistent_overlay(Some(overlay_id))
+                .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes)
                 .with_stdin(stdin_data);
             c.run_non_interactive(config)
         })
@@ -231,6 +242,7 @@ pub async fn exec_stream(
     env.extend(crate::secrets::expose_into_env(record_env));
     env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
+    let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Image-based machines stream from a container in their image (persistent
@@ -238,7 +250,11 @@ pub async fn exec_stream(
     // directly. Without this, streaming exec on an image machine produces no
     // output (the agent-base streaming path doesn't enter the container).
     let machine_rec = state.lookup_vm(&id).await?;
-    let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+    // An exec may be what establishes the workload container — the machine's
+    // command exited, or the image's own default was short-lived — and that
+    // container is where the mount lives, so the config has to target the
+    // machine rather than merely reuse its overlay.
+    let machine_for_run = machine_rec.clone();
     let machine_image = machine_rec.and_then(|r| r.image);
 
     // Bridge the blocking, synchronous vsock streaming exec to an async SSE
@@ -264,19 +280,20 @@ pub async fn exec_stream(
                     .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
                     .collect::<Vec<_>>()
             };
-            // A fork clone's inherited overlay lives under the golden's id.
-            let overlay_id =
-                crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
             with_machine_client_traced(&entry_exec, tid, move |c| {
                 if c.query(&image)?.is_none() {
                     c.pull_with_registry_config(&image)?;
                 }
+                // The volumes are derived from the env the machine will see, so
+                // keep a copy before the builder consumes it.
+                let env_for_volumes = env.clone();
                 let config = crate::agent::RunConfig::new(image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user)
                     .with_mounts(mounts_config)
                     .with_timeout(timeout)
-                    .with_persistent_overlay(Some(overlay_id));
+                    .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
                 c.run_streaming_with(config, |e| {
                     let _ = tx.send(e);
                 })
@@ -368,6 +385,7 @@ pub async fn run_command(
     env.extend(crate::secrets::expose_into_env(record_env));
     env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
+    let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Get mounts from machine config (converted to protocol format)
@@ -389,6 +407,7 @@ pub async fn run_command(
         let config = crate::agent::RunConfig::new(image, command)
             .with_env(env)
             .with_workdir(workdir)
+            .with_user(user)
             .with_mounts(mounts_config)
             .with_timeout(timeout);
         c.run_non_interactive(config)
@@ -438,7 +457,11 @@ pub async fn exec_interactive(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
+    let machine_record = state.lookup_vm(&id).await?;
+    let machine_image = machine_record.as_ref().and_then(|r| r.image.clone());
+    // An interactive session may be what establishes the workload container,
+    // and the mount lives there.
+    let machine_for_run = machine_record.clone();
 
     let command = vec![q.cmd.clone().unwrap_or_else(|| "/bin/sh".to_string())];
     let init_size = (q.cols.unwrap_or(80), q.rows.unwrap_or(24));
@@ -508,7 +531,7 @@ pub async fn exec_interactive(
                     let config = crate::agent::RunConfig::new(image, command)
                         .with_mounts(mounts_config)
                         .with_tty(true)
-                        .with_persistent_overlay(Some(id));
+                        .in_machine_opt(machine_for_run.as_ref(), &id, &[]);
                     client
                         .run_interactive_io(config, in_rx, on_output)
                         .unwrap_or_else(|e| {
@@ -783,37 +806,26 @@ pub async fn stream_logs(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// Read the last N lines from a file using a bounded ring buffer.
+/// Read a bounded byte tail, tolerating binary data and arbitrarily long lines.
 /// Returns (lines, file_position_at_end) for follow mode.
 fn read_last_n_lines_bounded(
     path: &std::path::Path,
     n: usize,
 ) -> std::io::Result<(Vec<String>, u64)> {
-    use std::collections::VecDeque;
-
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    let file_len = metadata.len();
-
-    // n == 0 means "no tail lines" — skip reading the file entirely
+    // n == 0 means "no tail lines" — skip reading the file entirely.
     if n == 0 {
-        return Ok((Vec::new(), file_len));
+        return Ok((Vec::new(), std::fs::metadata(path)?.len()));
     }
-
-    let reader = BufReader::new(file);
-
-    // Use a ring buffer to keep only the last N lines in memory
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(n + 1);
-
-    for line in reader.lines() {
-        let line = line?;
-        if ring.len() == n {
-            ring.pop_front();
-        }
-        ring.push_back(line);
-    }
-
-    Ok((ring.into_iter().collect(), file_len))
+    let (bytes, position) =
+        crate::log_rotation::read_tail(path, crate::log_rotation::MAX_LOG_SIZE)?;
+    let mut lines: Vec<String> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .rev()
+        .take(n)
+        .map(str::to_string)
+        .collect();
+    lines.reverse();
+    Ok((lines, position))
 }
 
 /// Maximum bytes to read per poll cycle (64 KiB).
@@ -848,4 +860,51 @@ fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(Stri
 
     let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((text, new_pos))
+}
+
+#[cfg(test)]
+mod console_reader_tests {
+    use super::*;
+
+    #[test]
+    fn tail_handles_invalid_utf8_and_bounds_an_unterminated_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let mut bytes = vec![b'x'; crate::log_rotation::MAX_LOG_SIZE as usize * 3];
+        bytes.extend_from_slice(b"\xff\nerror: Docker startup failed\n");
+        let file_length = bytes.len() as u64;
+        std::fs::write(&path, bytes).unwrap();
+        let (lines, position) = read_last_n_lines_bounded(&path, 10_000).unwrap();
+        assert_eq!(position, file_length);
+        assert_eq!(lines.last().unwrap(), "error: Docker startup failed");
+        assert!(lines.first().unwrap().contains('\u{fffd}'));
+        assert!(
+            lines.iter().map(String::len).sum::<usize>()
+                <= crate::log_rotation::MAX_LOG_SIZE as usize * 3
+        );
+    }
+
+    #[test]
+    fn tail_keeps_the_requested_line_count_for_text_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let lines: Vec<String> = (0..10_000)
+            .map(|i| format!("{i}: {}\n", "x".repeat(128)))
+            .collect();
+        std::fs::write(&path, lines.concat()).unwrap();
+        let (tail, _) = read_last_n_lines_bounded(&path, 10_000).unwrap();
+        assert_eq!(tail.len(), 10_000);
+        assert_eq!(tail[0], lines[0].trim_end());
+        assert_eq!(tail[9_999], lines[9_999].trim_end());
+    }
+
+    #[test]
+    fn zero_tail_does_not_read_previous_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        std::fs::write(&path, b"previous output\n").unwrap();
+        let (lines, position) = read_last_n_lines_bounded(&path, 0).unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(position, 16);
+    }
 }

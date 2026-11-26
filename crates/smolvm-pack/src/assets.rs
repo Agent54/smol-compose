@@ -12,6 +12,204 @@ use std::path::{Path, PathBuf};
 use crate::format::{AssetEntry, AssetInventory, LayerEntry};
 use crate::{PackError, Result};
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct SparseExtent {
+    offset: u64,
+    len: u64,
+}
+
+/// Return the allocated byte ranges of an APFS sparse file.
+///
+/// The `tar` crate intentionally disables its `SEEK_DATA`/`SEEK_HOLE` path on
+/// macOS, so its otherwise sparse-aware builder expands holes into a dense tar
+/// stream. Checkpoint RAM and disk images can be tens of GiB logically while
+/// containing only a few MiB of allocated pages; preserve those extents using
+/// the GNU sparse-tar representation that the same crate already restores.
+#[cfg(target_os = "macos")]
+fn macos_sparse_extents(file: &mut File) -> std::io::Result<Option<Vec<SparseExtent>>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    let logical_len = metadata.len();
+    if logical_len == 0 || metadata.blocks().saturating_mul(512) >= logical_len {
+        return Ok(None);
+    }
+
+    let mut extents = Vec::new();
+    let mut offset = 0_u64;
+    while offset < logical_len {
+        let seek_offset = i64::try_from(offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse file offset exceeds the host off_t range",
+            )
+        })?;
+        let data_offset = unsafe { libc::lseek(file.as_raw_fd(), seek_offset, libc::SEEK_DATA) };
+        if data_offset < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            // A filesystem without sparse-seek support is still valid; let the
+            // ordinary tar path copy it densely rather than failing a pack.
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                file.seek(SeekFrom::Start(0))?;
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        let data = data_offset as u64;
+        if data >= logical_len {
+            break;
+        }
+
+        let hole = unsafe { libc::lseek(file.as_raw_fd(), data_offset, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let hole = (hole as u64).min(logical_len);
+        if hole <= data {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sparse extent did not advance",
+            ));
+        }
+        extents.push(SparseExtent {
+            offset: data,
+            len: hole - data,
+        });
+        offset = hole;
+    }
+    file.seek(SeekFrom::Start(0))?;
+
+    let allocated = extents.iter().map(|extent| extent.len).sum::<u64>();
+    if allocated >= logical_len {
+        return Ok(None);
+    }
+    // A zero-length final entry carries a trailing hole's logical endpoint in
+    // old-GNU sparse tar. Without it extraction would truncate the file at the
+    // end of the final allocated extent.
+    if extents
+        .last()
+        .is_none_or(|extent| extent.offset + extent.len < logical_len)
+    {
+        extents.push(SparseExtent {
+            offset: logical_len,
+            len: 0,
+        });
+    }
+    Ok(Some(extents))
+}
+
+#[cfg(target_os = "macos")]
+fn append_macos_sparse_file<W: Write>(
+    builder: &mut tar::Builder<W>,
+    source: &Path,
+    archive_path: &Path,
+) -> std::io::Result<bool> {
+    let mut file = File::open(source)?;
+    let metadata = file.metadata()?;
+    let Some(extents) = macos_sparse_extents(&mut file)? else {
+        return Ok(false);
+    };
+    let stored_len = extents.iter().try_fold(0_u64, |total, extent| {
+        total.checked_add(extent.len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse archive payload is too large",
+            )
+        })
+    })?;
+
+    let mut header = tar::Header::new_gnu();
+    // Old-GNU sparse headers have a short path field. Let the ordinary tar
+    // builder emit its long-name extension rather than making an unrelated
+    // sparse asset with a long path un-packable.
+    if header.set_path(archive_path).is_err() {
+        return Ok(false);
+    }
+    header.set_metadata(&metadata);
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    header.set_size(stored_len);
+    let first_header_entries = {
+        let gnu = header.as_gnu_mut().expect("new GNU header");
+        gnu.set_real_size(metadata.len());
+        let slots_len = gnu.sparse.len();
+        for (extent, slot) in extents.iter().zip(gnu.sparse.iter_mut()) {
+            slot.set_offset(extent.offset);
+            slot.set_length(extent.len);
+        }
+        gnu.set_is_extended(extents.len() > slots_len);
+        slots_len
+    };
+    header.set_cksum();
+    builder.get_mut().write_all(header.as_bytes())?;
+
+    let remaining = &extents[first_header_entries.min(extents.len())..];
+    for (index, chunk) in remaining.chunks(21).enumerate() {
+        let mut extended = tar::GnuExtSparseHeader::new();
+        for (extent, slot) in chunk.iter().zip(extended.sparse_mut().iter_mut()) {
+            slot.set_offset(extent.offset);
+            slot.set_length(extent.len);
+        }
+        extended.set_is_extended((index + 1) * 21 < remaining.len());
+        builder.get_mut().write_all(extended.as_bytes())?;
+    }
+
+    for extent in &extents {
+        if extent.len == 0 {
+            continue;
+        }
+        file.seek(SeekFrom::Start(extent.offset))?;
+        let copied = std::io::copy(&mut (&file).take(extent.len), builder.get_mut())?;
+        if copied != extent.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sparse file changed while it was archived",
+            ));
+        }
+    }
+    let padding = (512 - stored_len % 512) % 512;
+    if padding != 0 {
+        builder
+            .get_mut()
+            .write_all(&[0_u8; 512][..padding as usize])?;
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn append_macos_tree<W: Write>(
+    builder: &mut tar::Builder<W>,
+    source: &Path,
+    archive_path: &Path,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        builder
+            .append_dir(archive_path, source)
+            .map_err(|error| PackError::Tar(error.to_string()))?;
+        let mut entries = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            append_macos_tree(
+                builder,
+                &entry.path(),
+                &archive_path.join(entry.file_name()),
+            )?;
+        }
+    } else if metadata.is_file() && append_macos_sparse_file(builder, source, archive_path)? {
+        // The sparse entry was written directly above.
+    } else {
+        builder
+            .append_path_with_name(source, archive_path)
+            .map_err(|error| PackError::Tar(error.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Convert a digest string to a filename for layer tars.
 ///
 /// Strips an optional `sha256:` prefix and uses the full remaining digest hex.
@@ -44,6 +242,32 @@ fn digest_to_filename(digest: &str) -> Result<String> {
 /// Compression level for zstd (3 = zstd default, fast with good ratio).
 /// Level 19 was ~100x slower for only ~10% better compression.
 pub const ZSTD_LEVEL: i32 = 3;
+
+fn compression_permit(cache: &Path) -> Result<File> {
+    fs::create_dir_all(cache)?;
+    // Never unlink this file: API exports run in separate CLI processes and
+    // must lock the same inode. Closing the handle releases admission on errors
+    // and process exit as well as success.
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(cache.join("asset-compression.lock"))?;
+    crate::extract::lock_file_exclusive(&file)?;
+    Ok(file)
+}
+
+fn compression_workers(parallelism: usize) -> u32 {
+    // Zero means zstd's synchronous mode, not automatic worker selection.
+    if parallelism <= 1 {
+        0
+    } else {
+        parallelism.min(4) as u32
+    }
+}
 
 /// Find a pre-formatted disk template by filename.
 ///
@@ -196,6 +420,12 @@ fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Subdirectory of `layers/` holding the workspace seed. Shared with the guest
+/// agent, which looks for exactly this path under `/packed_layers`.
+pub const WORKSPACE_SEED_DIR: &str = "workspace-seed";
+/// Name of the workspace seed tar inside [`WORKSPACE_SEED_DIR`].
+pub const WORKSPACE_SEED_FILE: &str = "workspace.tar";
+
 /// Asset collector for gathering runtime components.
 pub struct AssetCollector {
     staging_dir: PathBuf,
@@ -218,8 +448,10 @@ impl AssetCollector {
                 },
                 layers: Vec::new(),
                 storage_template: None,
+                storage_logical_size: None,
                 overlay_template: None,
                 overlay_logical_size: None,
+                workspace_seed: None,
             },
         })
     }
@@ -636,6 +868,52 @@ impl AssetCollector {
         Ok(())
     }
 
+    /// Add a stopped VM's persistent storage disk as the VM-mode template.
+    /// Trailing sparse space is stripped for packing and its original logical
+    /// size is recorded so cold-create can normalize one safe COW base.
+    pub fn add_vm_storage_template(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Err(PackError::AssetNotFound(format!(
+                "storage disk not found: {}",
+                path.display()
+            )));
+        }
+
+        const STORAGE_NAME: &str = "storage.ext4";
+        let dst = self.staging_dir.join(STORAGE_NAME);
+        let (logical_size, truncated_size) = sparse_copy_overlay(path, &dst)?;
+        self.inventory.storage_template = Some(AssetEntry {
+            path: STORAGE_NAME.to_string(),
+            size: truncated_size,
+        });
+        self.inventory.storage_logical_size = Some(logical_size);
+        Ok(())
+    }
+
+    /// Record a tar of the source machine's `/workspace` as the pack's
+    /// workspace seed.
+    ///
+    /// It lives in its own subdirectory under `layers/` so the guest, which
+    /// treats every top-level `*.tar` there as an image layer, never mistakes
+    /// it for one.
+    pub fn add_workspace_seed(&mut self, tar: &Path) -> Result<()> {
+        if !tar.exists() {
+            return Err(PackError::AssetNotFound(format!(
+                "workspace seed not found: {}",
+                tar.display()
+            )));
+        }
+        let rel = format!("layers/{}/{}", WORKSPACE_SEED_DIR, WORKSPACE_SEED_FILE);
+        let dst = self.staging_dir.join(&rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(tar, &dst).or_else(|_| std::fs::copy(tar, &dst).map(|_| ()))?;
+        let size = std::fs::metadata(&dst)?.len();
+        self.inventory.workspace_seed = Some(AssetEntry { path: rel, size });
+        Ok(())
+    }
+
     /// Get the current asset inventory.
     pub fn inventory(&self) -> &AssetInventory {
         &self.inventory
@@ -652,9 +930,42 @@ impl AssetCollector {
     /// (two-file mode: libs are embedded in the stub binary instead).
     /// When false, everything is included (single-file mode).
     pub fn compress(&self, output: &Path, exclude_libs: bool) -> Result<u64> {
-        let output_file = File::create(output)?;
-        let encoder = zstd::stream::Encoder::new(output_file, ZSTD_LEVEL)
+        let output_file = self.compress_with(|| File::create(output), exclude_libs)?;
+        Ok(output_file.metadata()?.len())
+    }
+
+    /// Compress into an owned writer so callers can checksum bytes as they are
+    /// emitted instead of copying and rereading a multi-GiB archive.
+    pub(crate) fn compress_to<W: Write>(&self, output: W, exclude_libs: bool) -> Result<W> {
+        self.compress_with(|| Ok(output), exclude_libs)
+    }
+
+    fn compress_with<W: Write>(
+        &self,
+        output: impl FnOnce() -> std::io::Result<W>,
+        exclude_libs: bool,
+    ) -> Result<W> {
+        // One asset compressor per cache root, including API subprocesses.
+        // The permit also covers finish(), which drains outstanding zstd jobs.
+        let cache = dirs::cache_dir()
+            .ok_or_else(|| PackError::Compression("cannot locate compression cache".into()))?
+            .join("smolvm");
+        let _permit = compression_permit(&cache).map_err(|error| {
+            PackError::Compression(format!(
+                "acquire compression admission at {}: {error}",
+                cache.display()
+            ))
+        })?;
+        let mut encoder = zstd::stream::Encoder::new(output()?, ZSTD_LEVEL)
             .map_err(|e| PackError::Compression(e.to_string()))?;
+        let workers = compression_workers(
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        );
+        if workers > 0 {
+            encoder
+                .multithread(workers)
+                .map_err(|e| PackError::Compression(e.to_string()))?;
+        }
         let mut tar_builder = tar::Builder::new(encoder);
 
         // Sort entries for deterministic tar ordering (consistent checksums)
@@ -669,14 +980,19 @@ impl AssetCollector {
                 continue; // libs go in the stub, not the sidecar
             }
             let path = entry.path();
-            if path.is_dir() {
-                tar_builder
-                    .append_dir_all(name.to_string_lossy().as_ref(), &path)
-                    .map_err(|e| PackError::Tar(e.to_string()))?;
-            } else {
-                tar_builder
-                    .append_path_with_name(&path, name.to_string_lossy().as_ref())
-                    .map_err(|e| PackError::Tar(e.to_string()))?;
+            #[cfg(target_os = "macos")]
+            append_macos_tree(&mut tar_builder, &path, Path::new(&name))?;
+            #[cfg(not(target_os = "macos"))]
+            {
+                if path.is_dir() {
+                    tar_builder
+                        .append_dir_all(name.to_string_lossy().as_ref(), &path)
+                        .map_err(|e| PackError::Tar(e.to_string()))?;
+                } else {
+                    tar_builder
+                        .append_path_with_name(&path, name.to_string_lossy().as_ref())
+                        .map_err(|e| PackError::Tar(e.to_string()))?;
+                }
             }
         }
 
@@ -685,10 +1001,7 @@ impl AssetCollector {
             .map_err(|e| PackError::Tar(e.to_string()))?;
         encoder
             .finish()
-            .map_err(|e| PackError::Compression(e.to_string()))?;
-
-        let metadata = fs::metadata(output)?;
-        Ok(metadata.len())
+            .map_err(|e| PackError::Compression(e.to_string()))
     }
 }
 
@@ -848,9 +1161,20 @@ pub fn crc32_file(path: &Path) -> Result<u32> {
 
 /// Calculate CRC32 checksum of multiple sections of a file.
 pub fn crc32_file_range(path: &Path, offset: u64, size: u64) -> Result<u32> {
-    use std::io::{Seek, SeekFrom};
-
     let mut file = File::open(path)?;
+    crc32_reader_range(&mut file, offset, size)
+}
+
+/// CRC32 of `size` bytes from `offset` of an already-open reader, so a caller
+/// that pins an artifact by descriptor verifies exactly the bytes it holds open
+/// rather than whatever a path resolves to at that instant.
+pub fn crc32_reader_range<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
+    offset: u64,
+    size: u64,
+) -> Result<u32> {
+    use std::io::SeekFrom;
+
     file.seek(SeekFrom::Start(offset))?;
 
     let mut hasher = crc32fast::Hasher::new();
@@ -962,6 +1286,33 @@ mod tests {
     }
 
     #[test]
+    fn vm_storage_template_preserves_logical_size_without_packing_the_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("storage.raw");
+        let mut file = File::create(&source).unwrap();
+        file.write_all(b"docker-layer").unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+
+        let staging = temp.path().join("staging");
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        collector.add_vm_storage_template(&source).unwrap();
+        let inventory = collector.inventory();
+        let template = inventory.storage_template.as_ref().unwrap();
+
+        assert_eq!(template.path, "storage.ext4");
+        assert_eq!(inventory.storage_logical_size, Some(4 * 1024 * 1024));
+        assert_eq!(
+            fs::metadata(staging.join(&template.path)).unwrap().len(),
+            template.size
+        );
+        assert!(template.size < 4 * 1024 * 1024);
+        assert_eq!(
+            fs::read(staging.join(&template.path)).unwrap(),
+            b"docker-layer"
+        );
+    }
+
+    #[test]
     fn test_crc32_basic() {
         let data = b"hello world";
         let checksum = crc32(data);
@@ -1063,6 +1414,169 @@ mod tests {
         let restored = output.join("test.txt");
         assert!(restored.exists());
         assert_eq!(fs::read_to_string(&restored).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn compression_worker_budget_is_bounded() {
+        assert_eq!(compression_workers(0), 0);
+        assert_eq!(compression_workers(1), 0);
+        assert_eq!(compression_workers(2), 2);
+        assert_eq!(compression_workers(4), 4);
+        assert_eq!(compression_workers(8), 4);
+        assert_eq!(compression_workers(usize::MAX), 4);
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for compression_admission_is_cross_process"]
+    fn compression_admission_child() {
+        let Some(root) = std::env::var_os("SMOLVM_TEST_COMPRESSION_ADMISSION") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        fs::write(root.join("ready"), b"ready").unwrap();
+        let _permit = compression_permit(&root).unwrap();
+        fs::write(root.join("admitted"), b"admitted").unwrap();
+    }
+
+    #[test]
+    fn compression_admission_is_cross_process() {
+        use std::time::{Duration, Instant};
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let permit = compression_permit(temp.path()).unwrap();
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "assets::tests::compression_admission_child",
+                    "--ignored",
+                ])
+                .env("SMOLVM_TEST_COMPRESSION_ADMISSION", temp.path())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !temp.path().join("ready").exists() {
+            assert!(Instant::now() < deadline, "child did not reach admission");
+            assert!(child.0.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let blocked_until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < blocked_until {
+            assert!(!temp.path().join("admitted").exists());
+            assert!(child.0.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(permit);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child stayed blocked after release"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(temp.path().join("admitted").exists());
+        // The inode remains available for later processes; it is not a stale
+        // ownership marker and does not need cleanup after the owner exits.
+        assert!(temp.path().join("asset-compression.lock").exists());
+        drop(compression_permit(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn compression_error_releases_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let collector = AssetCollector::new(temp.path().join("staging")).unwrap();
+        // Opening a directory as the output fails after admission is acquired.
+        assert!(collector.compress(temp.path(), false).is_err());
+        let output = temp.path().join("retry.zst");
+        assert!(collector.compress(&output, false).unwrap() > 0);
+    }
+
+    #[test]
+    fn concurrent_large_asset_exports_roundtrip_independently() {
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for seed in 0..4u8 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let temp = tempfile::tempdir().unwrap();
+                    let staging = temp.path().join("staging");
+                    let collector = AssetCollector::new(staging.clone()).unwrap();
+                    // Larger than a zstd job, with a different payload per caller.
+                    let payload: Vec<u8> = (0..12 * 1024 * 1024usize)
+                        .map(|i| (i.wrapping_mul(31) ^ (i >> 9)) as u8 ^ seed)
+                        .collect();
+                    fs::write(staging.join("payload"), &payload).unwrap();
+                    fs::create_dir(staging.join("lib")).unwrap();
+                    fs::write(staging.join("lib/excluded"), b"excluded").unwrap();
+                    barrier.wait();
+                    let compressed = temp.path().join("assets.zst");
+                    collector.compress(&compressed, true).unwrap();
+                    let output = temp.path().join("restored");
+                    decompress_assets_from_file(&compressed, &output).unwrap();
+                    assert_eq!(fs::read(output.join("payload")).unwrap(), payload);
+                    assert!(!output.join("lib").exists());
+                });
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compression_preserves_sparse_files_on_macos() {
+        use std::os::unix::fs::MetadataExt;
+
+        const LOGICAL_SIZE: u64 = 64 * 1024 * 1024;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        let collector = AssetCollector::new(staging.clone()).unwrap();
+        let checkpoint = staging.join("checkpoint");
+        fs::create_dir_all(&checkpoint).unwrap();
+        let memory = checkpoint.join("memory.bin");
+        let mut file = File::create(&memory).unwrap();
+        file.set_len(LOGICAL_SIZE).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(&[0xA5; 4096]).unwrap();
+        file.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        file.write_all(&[0x5A; 4096]).unwrap();
+        file.sync_all().unwrap();
+
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+        assert!(
+            fs::metadata(&compressed).unwrap().len() < 1024 * 1024,
+            "sparse holes were expanded into the compressed archive"
+        );
+
+        let output = temp_dir.path().join("output");
+        decompress_assets_from_file(&compressed, &output).unwrap();
+        let restored = output.join("checkpoint/memory.bin");
+        let metadata = fs::metadata(&restored).unwrap();
+        assert_eq!(metadata.len(), LOGICAL_SIZE);
+        assert!(metadata.blocks() * 512 < LOGICAL_SIZE / 4);
+        let mut restored = File::open(restored).unwrap();
+        let mut page = [0_u8; 4096];
+        restored.seek(SeekFrom::Start(4096)).unwrap();
+        restored.read_exact(&mut page).unwrap();
+        assert_eq!(page, [0xA5; 4096]);
+        restored.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        restored.read_exact(&mut page).unwrap();
+        assert_eq!(page, [0x5A; 4096]);
+        restored.seek(SeekFrom::End(-1)).unwrap();
+        restored.read_exact(&mut page[..1]).unwrap();
+        assert_eq!(page[0], 0);
     }
 }
 

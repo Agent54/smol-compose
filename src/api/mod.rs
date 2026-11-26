@@ -94,9 +94,11 @@ use state::ApiState;
         handlers::machines::get_machine,
         handlers::machines::get_machine_egress_events,
         handlers::machines::start_machine,
+        handlers::machines::branch_machine,
         handlers::machines::fork_machine,
         handlers::machines::release_held_fork,
         handlers::machines::stop_machine,
+        handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::export_machine,
@@ -158,6 +160,7 @@ use state::ApiState;
         // Response types
         types::HealthResponse,
         types::CapacityResponse,
+        types::CudaDeviceCapacity,
         types::MachineInfo,
         types::EgressDenialInfo,
         types::EgressEventsResponse,
@@ -188,10 +191,11 @@ use state::ApiState;
 )]
 pub struct ApiDoc;
 
-/// Default timeout for API requests (5 minutes).
-/// Most operations (start, stop, exec) complete within this time.
-/// Long-running operations like image pulls may need longer, but this
-/// provides a reasonable upper bound for most requests.
+/// Default timeout for bounded API requests (5 minutes).
+///
+/// Operations whose duration is controlled by the caller (exec/run), or by an
+/// explicit longer transfer deadline (image pulls), are deliberately not
+/// wrapped in this timeout.
 const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// Body cap for the file-upload route. axum's 2 MiB default silently 413s larger
@@ -227,7 +231,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
 
     // Explicit, control-initiated node drain (decommission). Stops all VMs
     // cleanly. Control-only by construction (the listener is mTLS-gated; the
-    // loopback door is localhost). See docs/lossless-serve-restart.md.
+    // loopback door is localhost).
     let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
 
     // Brokered P2P blob serving: hand a cached layer blob to a sibling node so a
@@ -250,33 +254,41 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     let logs_route = Router::new()
         .route("/{id}/logs", get(handlers::exec::stream_logs))
         .route(
+            "/{id}/checkpoint",
+            post(handlers::machines::capture_portable_checkpoint)
+                .put(handlers::machines::restore_portable_checkpoint),
+        )
+        .route(
             "/{id}/exec/interactive",
             get(handlers::exec::exec_interactive),
         );
 
-    // Machine routes with timeout
-    let machine_routes_with_timeout = Router::new()
-        .route("/", post(handlers::machines::create_machine))
+    // Bounded metadata and lifecycle routes. These have no caller-selected
+    // runtime and transfer no unbounded payload, so a stuck request should not
+    // occupy a server task forever.
+    let bounded_machine_routes = Router::new()
         .route("/", get(handlers::machines::list_machines))
         .route("/{id}", get(handlers::machines::get_machine))
         .route(
             "/{id}/egress-events",
             get(handlers::machines::get_machine_egress_events),
         )
-        .route("/{id}/start", post(handlers::machines::start_machine))
+        .route("/", post(handlers::machines::create_machine))
+        .route("/{id}/branches", post(handlers::machines::branch_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
+        .route(
+            "/{id}/branch-release",
+            post(handlers::machines::release_held_fork),
+        )
         .route(
             "/{id}/fork-release",
             post(handlers::machines::release_held_fork),
         )
         .route("/{id}/stop", post(handlers::machines::stop_machine))
+        .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
-        // Exec routes
-        .route("/{id}/exec", post(handlers::exec::exec_command))
-        .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
-        .route("/{id}/run", post(handlers::exec::run_command))
         // File I/O routes. The upload handler buffers the whole body (`body:
         // Bytes`), so without a raised limit axum's 2 MiB default rejects any
         // larger upload with a bare 413 "Failed to buffer the request body" —
@@ -289,19 +301,28 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             put(handlers::files::upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
         )
         .route("/{id}/files/{*path}", get(handlers::files::download_file))
-        // Image routes
         .route("/{id}/images", get(handlers::images::list_images))
-        .route("/{id}/images/pull", post(handlers::images::pull_image))
-        // Apply timeout only to these routes
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
         ));
 
+    // Long operations own their deadline. In particular, exec and run pass
+    // `timeout_secs` through to the guest agent; wrapping them in the generic
+    // five-minute timeout used to turn a valid 30-minute exec into an HTTP 408
+    // at 300 seconds. Image pulls already carry a ten-minute agent deadline.
+    let long_machine_routes = Router::new()
+        .route("/{id}/start", post(handlers::machines::start_machine))
+        .route("/{id}/exec", post(handlers::exec::exec_command))
+        .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
+        .route("/{id}/run", post(handlers::exec::run_command))
+        .route("/{id}/images/pull", post(handlers::images::pull_image));
+
     // Machine routes
     let machine_routes = Router::new()
         .merge(logs_route)
-        .merge(machine_routes_with_timeout);
+        .merge(bounded_machine_routes)
+        .merge(long_machine_routes);
 
     // Automatic pool operations are bounded by the same request timeout as
     // machine lifecycle calls. Pool fill and worker replacement happen in the
@@ -381,7 +402,9 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(middleware::from_fn(trace_id_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
+        }))
         .layer(cors)
         .with_state(state)
 }
@@ -457,7 +480,9 @@ pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> R
         .route("/capacity", get(handlers::node::capacity))
         .route("/metrics", get(serve_metrics))
         .layer(middleware::from_fn(trace_id_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
+        }))
         .layer(cors)
         .with_state(state)
 }

@@ -17,23 +17,23 @@
   gnutar,
   coreutils,
 }: let
-  version = "1.8.1";
+  version = "1.16.0";
 
   releases = {
     x86_64-linux = {
       asset = "smolvm-${version}-linux-x86_64.tar.gz";
       root = "smolvm-${version}-linux-x86_64";
-      hash = "sha256-RkmDT8kPSUgSYYs0lzEJfnFfJ4N64Il+s9sY0rYYXuk=";
+      hash = "sha256-lKHtsMQrIKxWLDdZ7SFrqyyrnifDgvZWCWkUT3vR3OM=";
     };
     aarch64-linux = {
       asset = "smolvm-${version}-linux-arm64.tar.gz";
       root = "smolvm-${version}-linux-arm64";
-      hash = "sha256-FV0JGonnrbfnLHW8eso2scaQjYcfNxyAEZgWEjhfNJc=";
+      hash = "sha256-ZZszEXNPLiznMWB+OP9mfLG11BPwYm4SrGSUOoBDbf8=";
     };
     aarch64-darwin = {
       asset = "smolvm-${version}-darwin-arm64.tar.gz";
       root = "smolvm-${version}-darwin-arm64";
-      hash = "sha256-TNXK4fdJ/YlHrJ8Xx/eyW0SZKnk1ITva4fFF5mpHtDc=";
+      hash = "sha256-SEtjxqfHTE0F3OLmP8zj0TXg+6VqHXcSgCTlc20zhKg=";
     };
   };
 
@@ -44,10 +44,16 @@
     bzip2
   ];
 
-  # crun/e2fsprogs/util-linux are Linux-only; the container runtime and mkfs.ext4
-  # only matter there. On darwin smolvm uses the host's own facilities.
+  # e2fsprogs is needed on EVERY host, not just Linux: `resize2fs` shrinks a
+  # machine's disk whenever one is asked for below the template size
+  # (src/disk_utils.rs:112 and :135 at 8dd8b18d), and the macOS branch of that
+  # error tells the user to `brew install e2fsprogs`. Without it on PATH the
+  # shrink is skipped with a warning and the machine silently gets the full
+  # template instead of the size that was requested. crun and util-linux stay
+  # Linux-only: the container runtime and mkfs.ext4 only matter there.
   runtimeDeps =
     [
+      e2fsprogs
       jq
       gzip
       gnutar
@@ -55,7 +61,6 @@
     ]
     ++ lib.optionals stdenv.hostPlatform.isLinux [
       crun
-      e2fsprogs
       util-linux
     ];
 in
